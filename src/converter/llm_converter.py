@@ -1,11 +1,33 @@
+from __future__ import annotations
+
 import logging
 from io import TextIOWrapper
+from pathlib import Path
 from typing import Any, List
 from enum import Enum
 
 from ...schema.protobuf.et_def_pb2 import *
 from ...schema.protobuf.et_def_pb2 import AttributeProto as ChakraAttr
 from ..third_party.utils.protolib import encodeMessage as encode_message
+from .et_validator import validate_et_group
+
+
+def _parse_trace_header(line: str) -> tuple[str, dict[str, str]]:
+    fields = line.strip().split()
+    if not fields:
+        raise ValueError("Trace header is empty")
+    if len(fields[1:]) % 2 != 0:
+        raise ValueError("Trace header must contain key: value pairs")
+
+    header = {}
+    for key, value in zip(fields[1::2], fields[2::2]):
+        if not key.endswith(":"):
+            raise ValueError(f"Malformed Trace header key {key!r}")
+        name = key[:-1]
+        if name in header:
+            raise ValueError(f"Duplicate Trace header key {name!r}")
+        header[name] = value
+    return fields[0], header
 
 
 # Memory type is deprecated for latest version of chakra & astra-sim
@@ -266,6 +288,60 @@ class LLMConverter:
     def add_parent(self, child_node: Any, parent_node: Any) -> None:
         child_node.data_deps.append(parent_node.id)
 
+    @staticmethod
+    def _reset_layer_state(layers: List[Layer]) -> None:
+        """Discard node references written while producing a previous ET."""
+        for layer in layers:
+            layer.comp_node = None
+            layer.comm_node = None
+            if not layer.is_expert and not layer.is_pim:
+                layer.input_memory_node = None
+                layer.weight_memory_node = None
+                layer.output_memory_node = None
+
+    @staticmethod
+    def _marker_regions(layers: List[Layer]) -> List[Any]:
+        """Return closed EXPERT/PIM regions as [start, end) Trace ranges."""
+        regions = []
+        active_kind = None
+        active_start = None
+        for index, layer in enumerate(layers):
+            if not layer.is_expert and not layer.is_pim:
+                continue
+            kind = "EXPERT" if layer.is_expert else "PIM"
+            marker = layer.expert_num if layer.is_expert else layer.pim_num
+            if marker == "END":
+                if active_kind != kind:
+                    raise ValueError(f"unmatched {kind} END marker at Trace row {index}")
+                regions.append((active_start, index + 1, kind))
+                active_kind = None
+                active_start = None
+            elif active_kind is None:
+                active_kind = kind
+                active_start = index
+            elif active_kind != kind:
+                raise ValueError(
+                    f"{kind} marker at Trace row {index} is nested inside "
+                    f"{active_kind} region starting at row {active_start}"
+                )
+        if active_kind is not None:
+            raise ValueError(
+                f"unclosed {active_kind} region starting at Trace row {active_start}"
+            )
+        return regions
+
+    def _validate_marker_boundaries(
+        self, layers: List[Layer], stage_boundaries: List[int]
+    ) -> None:
+        regions = self._marker_regions(layers)
+        for boundary in stage_boundaries:
+            for start, end, kind in regions:
+                if start <= boundary < end:
+                    raise ValueError(
+                        f"pp_stage_boundary {boundary} falls inside {kind} region "
+                        f"[{start}, {end})"
+                    )
+
     def get_stage_edges(self, num_layers: int, num_npu_group: int,
                         stage_boundaries: List[int]) -> List[Any]:
         """Resolve the [start, end) trace-line range owned by each pipeline stage.
@@ -282,6 +358,8 @@ class LLMConverter:
         the V projection -- so do not reintroduce that.
         """
         if num_npu_group == 1:
+            if stage_boundaries:
+                raise ValueError("PP1 Trace must not declare pp_stage_boundaries")
             return [(0, num_layers)]
         if len(stage_boundaries) != num_npu_group - 1:
             raise ValueError(
@@ -299,6 +377,10 @@ class LLMConverter:
     def convert_common(self, f: TextIOWrapper, num_layers: int, num_npu_group: int,
                        stage_boundaries: List[int] = None):
         layers: list[Layer] = self.get_layers(f)
+        if len(layers) != num_layers:
+            raise ValueError(
+                f"Trace declares {num_layers} rows but contains {len(layers)}"
+            )
 
         # vllm: check eviction or load
         evict = None
@@ -332,16 +414,20 @@ class LLMConverter:
             use_comm = False
         else:
             use_comm = True
+        self._validate_marker_boundaries(layers, stage_boundaries or [])
         stage_edges = self.get_stage_edges(num_layers, num_npu_group,
                                            stage_boundaries or [])
+        output_paths = []
 
         for npu_group in range(num_npu_group):
             for npu_offset in range(npus_per_group):
                 # Re-read the authoritative edges per rank: the walk below may
                 # rebind layer_end if it ever overruns.
                 layer_start, layer_end = stage_edges[npu_group]
+                self._reset_layer_state(layers)
                 npu_id = npu_group * npus_per_group + npu_offset + self.npu_offset
                 output_filename = "%s.%d.et" % (self.output_filename, npu_id)
+                output_paths.append(Path(output_filename))
                 first_comp_node = True
                 with open(output_filename, "wb") as g:
                     global_metadata = self.get_global_metadata()
@@ -560,14 +646,11 @@ class LLMConverter:
                             else:
                                 layer_num += 1
 
-                    # The frontend cuts stages on transformer-block boundaries,
-                    # so the walk above lands exactly on the stage edge. Expert
-                    # and PIM blocks live inside a block and can no longer be
-                    # straddled; warn loudly if that ever stops holding.
                     if layer_num != layer_end:
-                        print(f"Warning! pipeline stage {npu_group} walked to "
-                              f"layer {layer_num}, expected {layer_end}")
-                        layer_end = layer_num
+                        raise ValueError(
+                            f"pipeline stage {npu_group} consumed through Trace row "
+                            f"{layer_num}, expected frozen boundary {layer_end}"
+                        )
 
                     if npu_group == (num_npu_group - 1):
                         # Store output (for the last layer)
@@ -635,10 +718,15 @@ class LLMConverter:
                         else:
                             self.add_parent(send_output_node, layers[layer_end - 2].comp_node)
                         encode_message(g, send_output_node)
+        return output_paths
     
     def convert_prefill(self, f: TextIOWrapper, num_layers: int, num_npu_group: int,
                         stage_boundaries: List[int] = None):
         layers: list[Layer] = self.get_layers(f)
+        if len(layers) != num_layers:
+            raise ValueError(
+                f"Trace declares {num_layers} rows but contains {len(layers)}"
+            )
         # There will be no pim operation in prefill (PIM cannot perform GEMM)
 
         # vllm: check eviction or load
@@ -673,17 +761,21 @@ class LLMConverter:
             use_comm = False
         else:
             use_comm = True
+        self._validate_marker_boundaries(layers, stage_boundaries or [])
         stage_edges = self.get_stage_edges(num_layers, num_npu_group,
                                            stage_boundaries or [])
+        output_paths = []
 
         for npu_group in range(num_npu_group):
             for npu_offset in range(npus_per_group):
                 # Re-read the authoritative edges per rank: the walk below may
                 # rebind layer_end if it ever overruns.
                 layer_start, layer_end = stage_edges[npu_group]
+                self._reset_layer_state(layers)
                 npu_id = npu_group * npus_per_group + npu_offset + self.npu_offset
                 output_filename1 = "%s.%d.et" % (self.output_filename, npu_id)
                 output_filename2 = "%s.%d.et" % (self.output_filename, npu_id + self.num_npus) # sender for prefill-decode
+                output_paths.extend((Path(output_filename1), Path(output_filename2)))
                 first_comp_node = True
                 with open(output_filename1, "wb") as g, open(output_filename2, "wb") as s:
                     global_metadata = self.get_global_metadata()
@@ -852,14 +944,11 @@ class LLMConverter:
                                 layers[layer_num].comp_node = comp_node # is latest comp_node
                                 layer_num += 1
 
-                    # The frontend cuts stages on transformer-block boundaries,
-                    # so the walk above lands exactly on the stage edge. Expert
-                    # and PIM blocks live inside a block and can no longer be
-                    # straddled; warn loudly if that ever stops holding.
                     if layer_num != layer_end:
-                        print(f"Warning! pipeline stage {npu_group} walked to "
-                              f"layer {layer_num}, expected {layer_end}")
-                        layer_end = layer_num
+                        raise ValueError(
+                            f"pipeline stage {npu_group} consumed through Trace row "
+                            f"{layer_num}, expected frozen boundary {layer_end}"
+                        )
 
                     if npu_group == (num_npu_group - 1):
                         # Send output (for the last layer, to the paired decode npu)
@@ -915,11 +1004,18 @@ class LLMConverter:
                         else:
                             self.add_parent(send_output_node, layers[layer_end - 2].comp_node)
                         encode_message(g, send_output_node)
+        return output_paths
 
     def convert_event(self, f: TextIOWrapper, num_layers: int):
         layers: list[Layer] = self.get_layers(f)
+        if len(layers) != num_layers:
+            raise ValueError(
+                f"Trace declares {num_layers} rows but contains {len(layers)}"
+            )
+        output_paths = []
         for npu_id in range(self.num_npus):
             output_filename = "%s.%d.et" % (self.output_filename, npu_id)
+            output_paths.append(Path(output_filename))
             with open(output_filename, "wb") as g:
                 global_metadata = self.get_global_metadata()
                 encode_message(g, global_metadata)
@@ -929,25 +1025,24 @@ class LLMConverter:
                     layer.comp_time)
                     layer.comp_node = comp_node
                     encode_message(g, comp_node)
+        return output_paths
 
     def convert(self):
         with open(self.input_filename, "r") as f:
-            first_line = f.readline().strip().split()
-            execution_type = first_line[0]
-
-            # The first line carries "key: value" pairs after the execution
-            # type, e.g. "model_parallel_NPU_group: 4  pp_stage_boundaries: 73,145,217".
-            header = {}
-            fields = first_line[1:]
-            for i in range(0, len(fields) - 1, 2):
-                if fields[i].endswith(":"):
-                    header[fields[i][:-1]] = fields[i + 1]
-
-            num_npu_group = int(header.get("model_parallel_NPU_group", 0))
-            boundary_str = header.get("pp_stage_boundaries", "")
-            stage_boundaries = (
-                [int(b) for b in boundary_str.split(",")] if boundary_str else []
-            )
+            execution_type, header = _parse_trace_header(f.readline())
+            try:
+                num_npu_group = int(header.get("model_parallel_NPU_group", 0))
+            except ValueError as exc:
+                raise ValueError("invalid model_parallel_NPU_group in Trace header") from exc
+            boundary_text = header.get("pp_stage_boundaries", "")
+            try:
+                stage_boundaries = (
+                    [int(value) for value in boundary_text.split(",")]
+                    if boundary_text
+                    else []
+                )
+            except ValueError as exc:
+                raise ValueError("invalid pp_stage_boundaries in Trace header") from exc
 
             second_line = f.readline().strip()
             num_layers = int(second_line)
@@ -957,16 +1052,24 @@ class LLMConverter:
             if execution_type == "COLOCATED":
                 if num_npu_group <= 0:
                     raise ValueError(f"model_parallel_NPU_group <= 0")
-                self.convert_common(f, num_layers, num_npu_group, stage_boundaries)
+                outputs = self.convert_common(
+                    f, num_layers, num_npu_group, stage_boundaries
+                )
             elif execution_type == "PREFILL":
                 if num_npu_group <= 0:
                     raise ValueError(f"model_parallel_NPU_group <= 0")
-                self.convert_prefill(f, num_layers, num_npu_group, stage_boundaries)
+                outputs = self.convert_prefill(
+                    f, num_layers, num_npu_group, stage_boundaries
+                )
             elif execution_type == "DECODE":
                 if num_npu_group <= 0:
                     raise ValueError(f"model_parallel_NPU_group <= 0")
-                self.convert_common(f, num_layers, num_npu_group, stage_boundaries)
+                outputs = self.convert_common(
+                    f, num_layers, num_npu_group, stage_boundaries
+                )
             elif execution_type == "EVENT":
-                self.convert_event(f, num_layers)
+                outputs = self.convert_event(f, num_layers)
             else:
                 raise ValueError(f"Unsupported execution type, {execution_type}")
+        validate_et_group(outputs)
+        return outputs
