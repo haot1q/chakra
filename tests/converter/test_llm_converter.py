@@ -256,6 +256,16 @@ def _write_nodes(path: Path, nodes: list[Node]) -> None:
             encodeMessage(stream, node)
 
 
+def test_et_validator_rejects_node_disguised_as_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "missing-metadata.et"
+    with path.open("wb") as stream:
+        encodeMessage(stream, Node(id=1))
+        encodeMessage(stream, Node(id=2, name="payload"))
+
+    with pytest.raises(ETValidationError, match="invalid GlobalMetadata"):
+        validate_et_group([path])
+
+
 def test_et_validator_rejects_missing_local_dependency(tmp_path: Path) -> None:
     node = Node(id=1, name="orphan")
     node.data_deps.append(99)

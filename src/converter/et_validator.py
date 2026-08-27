@@ -32,12 +32,27 @@ class ETValidationReport:
     recv_count: int
 
 
+def _validate_metadata(path: Path, metadata: GlobalMetadata) -> None:
+    has_version = bool(metadata.version.strip())
+    has_schema = any(
+        attr.name == "schema"
+        and attr.WhichOneof("value") == "string_val"
+        and bool(attr.string_val.strip())
+        for attr in metadata.attr
+    )
+    if not (has_version or has_schema):
+        raise ETValidationError(
+            f"{path}: invalid GlobalMetadata; expected a non-empty version or schema"
+        )
+
+
 def _read_nodes(path: Path) -> list[Node]:
     try:
         with path.open("rb") as stream:
             metadata = GlobalMetadata()
             if not decode_message(stream, metadata):
                 raise ETValidationError(f"{path}: missing GlobalMetadata")
+            _validate_metadata(path, metadata)
             nodes = []
             while True:
                 node = Node()
