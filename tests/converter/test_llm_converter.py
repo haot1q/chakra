@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import pytest
 
 from chakra.schema.protobuf.et_def_pb2 import GlobalMetadata, Node
 from chakra.src.converter.et_validator import ETValidationError, validate_et_group
 from chakra.src.converter.llm_converter import LLMConverter
-from chakra.src.third_party.utils.protolib import encodeMessage
+from chakra.src.converter.tier_manifest import canonical_manifest_digest
+from chakra.src.third_party.utils.protolib import decodeMessage, encodeMessage
 
 
 def _layer(
@@ -219,6 +221,140 @@ def test_prefill_validates_decode_pair_outputs(tmp_path: Path) -> None:
     ).convert()
 
     assert validate_et_group(outputs).file_count == 4
+
+
+def _write_native_manifest(path: Path) -> str:
+    payload = {
+        "schema_version": "memory-tier-runtime-v1",
+        "id_mode": "native",
+        "tiers": [
+            {
+                "tier_name": name,
+                "tier_id": 16 + index,
+                "backend_kind": "analytical",
+                "scope": "instance",
+                "pool_key": name,
+                "devices": [{"device_id": 0, "capacity_bytes": 1024}],
+                "num_devices": 1,
+                "mem_bw_gbps": 1000,
+                "mem_latency_ns": 100,
+            }
+            for index, name in enumerate(("hbm", "lpddr", "remote"))
+        ],
+    }
+    payload["manifest_digest"] = canonical_manifest_digest(payload)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return payload["manifest_digest"]
+
+
+def _native_layer(name: str, segments: str = "-") -> str:
+    weight_size = 0 if segments != "-" else 16
+    return (
+        f"{name} 1 hbm:0 16 hbm:0 {weight_size} hbm:0 16 "
+        f"NONE 0 NONE {segments}\n"
+    )
+
+
+def _read_et(path: Path) -> tuple[GlobalMetadata, list[Node]]:
+    metadata = GlobalMetadata()
+    nodes = []
+    with path.open("rb") as stream:
+        assert decodeMessage(stream, metadata)
+        while True:
+            node = Node()
+            if not decodeMessage(stream, node):
+                break
+            nodes.append(node)
+    return metadata, nodes
+
+
+def _uint_attr(node: Node, name: str) -> int:
+    return next(attr.uint32_val for attr in node.attr if attr.name == name)
+
+
+def test_native_segments_emit_one_compute_with_multiple_load_parents(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "tiers.json"
+    digest = _write_native_manifest(manifest_path)
+    trace = tmp_path / "native.txt"
+    rows = [
+        _native_layer("moe", "hbm:0@64,lpddr:0@128"),
+        _native_layer("output"),
+    ]
+    _write_trace(
+        trace,
+        rows,
+        pp_size=1,
+        header_suffix=(
+            f"  trace_schema: llm-tier-v1  tier_manifest_digest: {digest}"
+        ),
+    )
+
+    outputs = LLMConverter(
+        str(trace),
+        str(tmp_path / "llm"),
+        num_npus=1,
+        tier_manifest=str(manifest_path),
+    ).convert()
+
+    metadata, nodes = _read_et(outputs[0])
+    metadata_attrs = {attr.name: attr.string_val for attr in metadata.attr}
+    assert metadata_attrs["tier_manifest_digest"] == digest
+    segment_loads = [node for node in nodes if "WEIGHT_SEGMENT" in node.name]
+    moe_compute = [node for node in nodes if node.name == "COMP_NODE_moe"]
+    assert len(segment_loads) == 2
+    assert len(moe_compute) == 1
+    assert [_uint_attr(node, "tensor_loc") for node in segment_loads] == [16, 17]
+    assert [_uint_attr(node, "tensor_device") for node in segment_loads] == [0, 0]
+    assert set(moe_compute[0].data_deps).issuperset(
+        {node.id for node in segment_loads}
+    )
+
+
+def test_native_trace_digest_mismatch_fails_before_conversion(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "tiers.json"
+    _write_native_manifest(manifest_path)
+    trace = tmp_path / "stale.txt"
+    _write_trace(
+        trace,
+        [_native_layer("a"), _native_layer("b")],
+        pp_size=1,
+        header_suffix=(
+            "  trace_schema: llm-tier-v1  "
+            f"tier_manifest_digest: sha256:{'0' * 64}"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="tier_manifest_digest mismatch"):
+        LLMConverter(
+            str(trace),
+            str(tmp_path / "llm"),
+            num_npus=1,
+            tier_manifest=str(manifest_path),
+        ).convert()
+
+
+def test_native_unknown_segment_tier_fails_closed(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "tiers.json"
+    digest = _write_native_manifest(manifest_path)
+    trace = tmp_path / "unknown.txt"
+    _write_trace(
+        trace,
+        [_native_layer("a", "missing:0@64"), _native_layer("b")],
+        pp_size=1,
+        header_suffix=(
+            f"  trace_schema: llm-tier-v1  tier_manifest_digest: {digest}"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Cannot parse"):
+        LLMConverter(
+            str(trace),
+            str(tmp_path / "llm"),
+            num_npus=1,
+            tier_manifest=str(manifest_path),
+        ).convert()
 
 
 @pytest.mark.parametrize(

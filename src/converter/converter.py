@@ -37,7 +37,14 @@ def convert_pytorch(args: argparse.Namespace) -> None:
 
 def convert_llm(args: argparse.Namespace) -> None:
     """Convert llm text input trace to Chakra execution trace."""
-    converter = LLMConverter(args.input, args.output, args.num_npus, args.npu_offset, args.local_offloading)
+    converter = LLMConverter(
+        args.input,
+        args.output,
+        args.num_npus,
+        args.npu_offset,
+        args.local_offloading,
+        args.tier_manifest,
+    )
     converter.convert()
 
 
@@ -145,6 +152,16 @@ def main() -> None:
         action="store_true",
         help="Enable weight offloading in local (device) memory. Default is False.",
         default=False,
+    )
+
+    llm_parser.add_argument(
+        "--tier-manifest",
+        type=str,
+        default=None,
+        help=(
+            "Native memory-tier-runtime-v1 JSON manifest. Required for an "
+            "llm-tier-v1 Trace and rejected for a legacy Trace."
+        ),
     )
     
     llm_parser.set_defaults(func=convert_llm)
