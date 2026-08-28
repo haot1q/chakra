@@ -10,6 +10,7 @@ from ...schema.protobuf.et_def_pb2 import *
 from ...schema.protobuf.et_def_pb2 import AttributeProto as ChakraAttr
 from ..third_party.utils.protolib import encodeMessage as encode_message
 from .et_validator import validate_et_group
+from .tier_manifest import TierManifest
 
 
 def _parse_trace_header(line: str) -> tuple[str, dict[str, str]]:
@@ -42,7 +43,7 @@ class MemoryType(Enum):
 
 
 class Layer:
-    def __init__(self, line: str):
+    def __init__(self, line: str, manifest: TierManifest | None = None):
         try:
             col = line.strip().split()
             if col[0] == 'EXPERT': # If Expert Flag
@@ -79,6 +80,7 @@ class Layer:
                 self.weight_memory_loc = str(col[4])
                 self.weight_memory_size = int(col[5])
                 self.weight_memory_node = None
+                self.weight_memory_nodes = []
                 self.output_memory_loc = str(col[6])
                 self.output_memory_size = int(col[7])
                 self.output_memory_node = None
@@ -89,8 +91,37 @@ class Layer:
                 self.comm_node = None
 
                 self.misc = str(col[10])
-        except:
-            raise ValueError(f"Cannot parse the following layer -- \"{line}\"")
+                self.weight_segments = []
+                if manifest is not None:
+                    if len(col) != 12:
+                        raise ValueError("native Trace rows must contain 12 columns")
+                    segment_text = col[11]
+                    if segment_text != "-":
+                        if self.weight_memory_size != 0:
+                            raise ValueError(
+                                "native multi-segment rows must set weight_size to 0"
+                            )
+                        previous_key = None
+                        seen_locations = set()
+                        for segment in segment_text.split(","):
+                            location, separator, raw_size = segment.partition("@")
+                            if not separator or not raw_size.isdigit() or int(raw_size) <= 0:
+                                raise ValueError(f"invalid weight segment {segment!r}")
+                            tier_id, device_id = manifest.resolve(location)
+                            key = (tier_id, device_id)
+                            if key in seen_locations:
+                                raise ValueError(f"duplicate weight segment {location!r}")
+                            if previous_key is not None and key <= previous_key:
+                                raise ValueError("weight segments must be sorted by tier_id/device_id")
+                            self.weight_segments.append((location, int(raw_size)))
+                            seen_locations.add(key)
+                            previous_key = key
+                elif len(col) != 11:
+                    raise ValueError("legacy Trace rows must contain 11 columns")
+        except (IndexError, KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"Cannot parse the following layer -- \"{line}\": {error}"
+            ) from error
 
     @staticmethod
     def _parse_comm_type(s: str):
@@ -114,12 +145,15 @@ class LLMConverter:
         num_npus: int,
         npu_offset: int = 0,
         local_offloading: bool = False,
+        tier_manifest: str | None = None,
     ):
         self.input_filename = input_filename
         self.output_filename = output_filename
         self.num_npus = num_npus
         self.npu_offset = npu_offset
         self.local_offloading = local_offloading
+        self.manifest = TierManifest(tier_manifest) if tier_manifest else None
+        self.native_trace = False
         self.next_node_id = 0
 
         # For send & recv nodes
@@ -134,13 +168,22 @@ class LLMConverter:
             ChakraAttr(name="schema", string_val="1.0.2-chakra.0.0.4"),
             ChakraAttr(name="input_file", string_val=input_text),
         ]
+        if self.native_trace:
+            attr.append(
+                ChakraAttr(
+                    name="tier_manifest_digest",
+                    string_val=self.manifest.digest,
+                )
+            )
         metadata = GlobalMetadata(attr=attr)
         return metadata
     
     def get_layers(self, f: TextIOWrapper) -> List[Layer]:
         layers: List[Layer] = []
         for line in f:
-            layers.append(Layer(line))
+            manifest = getattr(self, "manifest", None)
+            native_trace = getattr(self, "native_trace", False)
+            layers.append(Layer(line, manifest if native_trace else None))
         return layers
 
     def get_next_node_id(self) -> int:
@@ -213,6 +256,8 @@ class LLMConverter:
         return node
     
     def get_mem_type(self, mem_type: str) -> int:
+        if self.native_trace:
+            return self.manifest.resolve(mem_type)[0]
         mem_type = mem_type.split(':')[0]  # Exclude the device number if present
         if mem_type == "LOCAL":
             return MemoryType.LOCAL_MEMORY.value
@@ -233,6 +278,8 @@ class LLMConverter:
         - "REMOTE:1"        -> returns 1
         - "REMOTE:1.3"      -> returns 1  (device = 1, channel = 3)
         """
+        if self.native_trace:
+            return self.manifest.resolve(mem_type)[1]
         parts = mem_type.split(":", 1)
         if len(parts) == 2:
             # parts[1] may be "1" or "1.3"
@@ -288,6 +335,30 @@ class LLMConverter:
     def add_parent(self, child_node: Any, parent_node: Any) -> None:
         child_node.data_deps.append(parent_node.id)
 
+    def get_weight_load_nodes(self, layer: Layer) -> List[Any]:
+        if layer.weight_segments:
+            return [
+                self.get_memory_load_node(
+                    layer.name,
+                    f"WEIGHT_SEGMENT_{index}",
+                    location,
+                    size,
+                )
+                for index, (location, size) in enumerate(layer.weight_segments)
+            ]
+        if (
+            self.local_offloading or layer.weight_memory_loc != "LOCAL"
+        ) and layer.weight_memory_size > 0:
+            return [
+                self.get_memory_load_node(
+                    layer.name,
+                    "WEIGHT",
+                    layer.weight_memory_loc,
+                    layer.weight_memory_size,
+                )
+            ]
+        return []
+
     @staticmethod
     def _reset_layer_state(layers: List[Layer]) -> None:
         """Discard node references written while producing a previous ET."""
@@ -297,6 +368,7 @@ class LLMConverter:
             if not layer.is_expert and not layer.is_pim:
                 layer.input_memory_node = None
                 layer.weight_memory_node = None
+                layer.weight_memory_nodes = []
                 layer.output_memory_node = None
 
     @staticmethod
@@ -479,17 +551,12 @@ class LLMConverter:
                     layer_num = layer_start
                     while expert_start or pim_start or attn_remain or layer_num < layer_end:
                         if not layers[layer_num].is_expert and not layers[layer_num].is_pim: 
-                            if (self.local_offloading or layers[layer_num].weight_memory_loc != "LOCAL") and layers[layer_num].weight_memory_size > 0:
-                                # Load weight (for weight offloading)
-                                weight_load_node = self.get_memory_load_node(
-                                    layers[layer_num].name,
-                                    "WEIGHT",
-                                    layers[layer_num].weight_memory_loc,
-                                    layers[layer_num].weight_memory_size,
-                                )
-                                layers[layer_num].weight_memory_node = weight_load_node
+                            layers[layer_num].weight_memory_nodes = (
+                                self.get_weight_load_nodes(layers[layer_num])
+                            )
+                            for weight_load_node in layers[layer_num].weight_memory_nodes:
                                 if expert_start:
-                                    self.add_parent(weight_load_node, comp_node) # dependent to previous comp_node due to gate function
+                                    self.add_parent(weight_load_node, comp_node)
                                 encode_message(g, weight_load_node)
                             # Compute
                             if layers[layer_num].comp_time != 0 and not pim_start: # pim computation is handled pim_comp_node
@@ -517,12 +584,12 @@ class LLMConverter:
                                             self.add_parent(comp_node, evict)
                                         if load != None:
                                             self.add_parent(comp_node, load)
-                                        if layers[layer_num].weight_memory_node != None:
-                                            self.add_parent(comp_node, layers[layer_num].weight_memory_node)
+                                        for weight_node in layers[layer_num].weight_memory_nodes:
+                                            self.add_parent(comp_node, weight_node)
                                         first_comp_node = False
                                     else:
-                                        if layers[layer_num].weight_memory_node != None:
-                                            self.add_parent(comp_node, layers[layer_num].weight_memory_node)
+                                        for weight_node in layers[layer_num].weight_memory_nodes:
+                                            self.add_parent(comp_node, weight_node)
                                         if layers[layer_num - 1].comm_node != None:
                                             self.add_parent(comp_node, layers[layer_num - 1].comm_node)
                                         elif layers[layer_num - 1].comp_node != None:
@@ -822,17 +889,12 @@ class LLMConverter:
                     layer_num = layer_start
                     while expert_start or layer_num < layer_end:
                         if not layers[layer_num].is_expert:
-                            if (self.local_offloading or layers[layer_num].weight_memory_loc != "LOCAL") and layers[layer_num].weight_memory_size > 0:
-                                # Load weight (for weight offloading)
-                                weight_load_node = self.get_memory_load_node(
-                                    layers[layer_num].name,
-                                    "WEIGHT",
-                                    layers[layer_num].weight_memory_loc,
-                                    layers[layer_num].weight_memory_size,
-                                )
-                                layers[layer_num].weight_memory_node = weight_load_node
+                            layers[layer_num].weight_memory_nodes = (
+                                self.get_weight_load_nodes(layers[layer_num])
+                            )
+                            for weight_load_node in layers[layer_num].weight_memory_nodes:
                                 if expert_start:
-                                    self.add_parent(weight_load_node, comp_node) # dependent to previous comp_node due to gate function
+                                    self.add_parent(weight_load_node, comp_node)
                                 encode_message(g, weight_load_node)
                             
                             # Compute
@@ -851,12 +913,12 @@ class LLMConverter:
                                         self.add_parent(comp_node, evict)
                                     if load != None:
                                         self.add_parent(comp_node, load)
-                                    if layers[layer_num].weight_memory_node != None:
-                                        self.add_parent(comp_node, layers[layer_num].weight_memory_node)
+                                    for weight_node in layers[layer_num].weight_memory_nodes:
+                                        self.add_parent(comp_node, weight_node)
                                     first_comp_node = False
                                 else:
-                                    if layers[layer_num].weight_memory_node != None:
-                                        self.add_parent(comp_node, layers[layer_num].weight_memory_node)
+                                    for weight_node in layers[layer_num].weight_memory_nodes:
+                                        self.add_parent(comp_node, weight_node)
                                     if layers[layer_num - 1].comm_node != None:
                                         self.add_parent(comp_node, layers[layer_num - 1].comm_node)
                                     elif layers[layer_num - 1].comp_node != None:
@@ -1030,6 +1092,21 @@ class LLMConverter:
     def convert(self):
         with open(self.input_filename, "r") as f:
             execution_type, header = _parse_trace_header(f.readline())
+            trace_schema = header.get("trace_schema")
+            trace_digest = header.get("tier_manifest_digest")
+            native_header = trace_schema is not None or trace_digest is not None
+            if native_header:
+                if trace_schema != "llm-tier-v1":
+                    raise ValueError("native Trace requires trace_schema: llm-tier-v1")
+                if self.manifest is None:
+                    raise ValueError("native Trace requires --tier-manifest")
+                if trace_digest != self.manifest.digest:
+                    raise ValueError(
+                        "tier_manifest_digest mismatch between Trace and manifest"
+                    )
+                self.native_trace = True
+            elif self.manifest is not None:
+                raise ValueError("legacy Trace must not be used with --tier-manifest")
             try:
                 num_npu_group = int(header.get("model_parallel_NPU_group", 0))
             except ValueError as exc:

@@ -92,6 +92,26 @@ void ETFeeder::readGlobalMetadata() {
   shared_ptr<ChakraProtoMsg::GlobalMetadata> pkt_msg =
       make_shared<ChakraProtoMsg::GlobalMetadata>();
   trace_.read(*pkt_msg);
+  for (const auto& attr : pkt_msg->attr()) {
+    if (attr.name() != "tier_manifest_digest") {
+      continue;
+    }
+    if (!tier_manifest_digest_.empty()) {
+      throw runtime_error("Duplicate tier_manifest_digest metadata attribute");
+    }
+    if (!attr.has_string_val() || attr.string_val().empty()) {
+      throw runtime_error("tier_manifest_digest metadata must be a string");
+    }
+    tier_manifest_digest_ = attr.string_val();
+  }
+}
+
+const string& ETFeeder::tierManifestDigest() const {
+  return tier_manifest_digest_;
+}
+
+bool ETFeeder::hasTierManifestDigest() const {
+  return !tier_manifest_digest_.empty();
 }
 
 shared_ptr<ETFeederNode> ETFeeder::readNode() {
