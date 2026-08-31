@@ -659,6 +659,106 @@ def test_et_validator_rejects_dependency_cycle(tmp_path: Path) -> None:
         validate_et_group([path])
 
 
+def _has_attr(node: Node, name: str) -> bool:
+    return any(attr.name == name for attr in node.attr)
+
+
+def _write_ucie_manifest(path: Path) -> str:
+    payload = {
+        "schema_version": "memory-tier-runtime-v1",
+        "id_mode": "native",
+        "tiers": [
+            {
+                "tier_name": name,
+                "tier_id": 16 + index,
+                "backend_kind": "analytical",
+                "scope": "instance",
+                "pool_key": name,
+                "devices": [{"device_id": 0, "capacity_bytes": 1024}],
+                "num_devices": 1,
+                "mem_bw_gbps": 1000,
+                "mem_latency_ns": 100,
+            }
+            for index, name in enumerate(("hbm", "lpddr", "remote"))
+        ],
+        "ucie_links": [
+            {
+                "id": "ucie-frontside",
+                "endpoints": ["compute", "hbm"],
+                "stack_count": 1,
+                "header_bytes": 64,
+                "latency_ns": 0,
+                "bandwidth_resource": {
+                    "schema_version": "bandwidth-resource-v1",
+                    "read_bytes_per_second": 500_000_000,
+                    "write_bytes_per_second": 500_000_000,
+                    "shared_bytes_per_second": 1_000_000_000,
+                    "concurrency": "simultaneous",
+                    "turnaround_ns": 0,
+                },
+            }
+        ],
+    }
+    payload["manifest_digest"] = canonical_manifest_digest(payload)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return payload["manifest_digest"]
+
+
+def test_native_ucie_links_annotate_hot_mem_nodes_only(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "tiers.json"
+    digest = _write_ucie_manifest(manifest_path)
+    trace = tmp_path / "native.txt"
+    _write_trace(
+        trace,
+        [_native_layer("block0_layernorm"), _native_layer("unrelated")],
+        pp_size=1,
+        header_suffix=(
+            f"  trace_schema: llm-tier-v1  tier_manifest_digest: {digest}"
+        ),
+    )
+
+    outputs = LLMConverter(
+        str(trace),
+        str(tmp_path / "llm"),
+        num_npus=1,
+        tier_manifest=str(manifest_path),
+    ).convert()
+    _, nodes = _read_et(outputs[0])
+    mem_nodes = [node for node in nodes if node.name.startswith("MEM_")]
+    assert mem_nodes
+    for node in mem_nodes:
+        loc = next(attr.uint32_val for attr in node.attr if attr.name == "tensor_loc")
+        if loc == 16:
+            assert _string_attr(node, "ucie_transport_schema_version") == (
+                "ucie-transport-v1"
+            )
+            assert _string_attr(node, "ucie_link_id") == "ucie-frontside"
+        else:
+            assert not _has_attr(node, "ucie_link_id")
+
+
+def test_folded_native_manifest_omits_ucie_attrs(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "tiers.json"
+    digest = _write_native_manifest(manifest_path)
+    trace = tmp_path / "native.txt"
+    _write_trace(
+        trace,
+        [_native_layer("block0_layernorm"), _native_layer("unrelated")],
+        pp_size=1,
+        header_suffix=(
+            f"  trace_schema: llm-tier-v1  tier_manifest_digest: {digest}"
+        ),
+    )
+    outputs = LLMConverter(
+        str(trace),
+        str(tmp_path / "llm"),
+        num_npus=1,
+        tier_manifest=str(manifest_path),
+    ).convert()
+    _, nodes = _read_et(outputs[0])
+    assert not any(_has_attr(node, "ucie_link_id") for node in nodes)
+
+
 def test_et_validator_rejects_unpaired_pipeline_send(tmp_path: Path) -> None:
     trace = tmp_path / "moe.txt"
     _write_trace(trace, _moe_rows(), boundaries="6")

@@ -48,6 +48,44 @@ def canonical_manifest_digest(payload: Mapping[str, object]) -> str:
     return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
 
 
+def _parse_ucie_peers(
+    raw_links: object, tiers: Mapping[str, tuple[int, int]]
+) -> dict[str, str]:
+    """Map hot-tier names to opt-in UCIe link ids. Absent links emit nothing."""
+
+    if raw_links is None:
+        return {}
+    if not isinstance(raw_links, list) or not raw_links:
+        raise ValueError("ucie_links must be a non-empty array when present")
+    peers: dict[str, str] = {}
+    seen_ids: set[str] = set()
+    for index, raw in enumerate(raw_links):
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"ucie_links[{index}] must be an object")
+        link_id = raw.get("id")
+        endpoints = raw.get("endpoints")
+        if not isinstance(link_id, str) or not link_id:
+            raise ValueError(f"ucie_links[{index}].id must be a non-empty string")
+        if link_id in seen_ids or link_id in tiers:
+            raise ValueError(f"ucie_links[{index}].id collides or is duplicate")
+        if (
+            not isinstance(endpoints, list)
+            or len(endpoints) != 2
+            or any(not isinstance(item, str) or not item for item in endpoints)
+        ):
+            raise ValueError(f"ucie_links[{index}].endpoints must be two strings")
+        if "compute" not in endpoints:
+            raise ValueError(f"ucie_links[{index}] must include the compute endpoint")
+        peer = next(item for item in endpoints if item != "compute")
+        if peer not in tiers:
+            raise ValueError(f"ucie_links[{index}] peer {peer!r} is not a tier")
+        if peer in peers:
+            raise ValueError(f"ucie_links[{index}] peer {peer!r} already has a link")
+        seen_ids.add(link_id)
+        peers[peer] = link_id
+    return peers
+
+
 class TierManifest:
     """Validated tier/device lookup used by the LLM converter."""
 
@@ -109,6 +147,11 @@ class TierManifest:
                 f"manifest_digest mismatch: declared={digest}, expected={expected_digest}"
             )
         self.digest = digest
+        self._ucie_by_peer = _parse_ucie_peers(payload.get("ucie_links"), self._tiers)
+
+    def ucie_link_id(self, location: str) -> str | None:
+        name = location.split(":", 1)[0]
+        return self._ucie_by_peer.get(name)
 
     def resolve(self, location: str) -> tuple[int, int]:
         if not isinstance(location, str) or not location:
