@@ -281,6 +281,7 @@ def _write_movement_events(
     digest: str,
     *,
     selected_path: str = "base_die_local",
+    implemented_contract: bool = False,
 ) -> None:
     resources = (
         ["lpddr_read", "base_die_dma", "local_stack_fabric", "hbm_write"]
@@ -293,6 +294,70 @@ def _write_movement_events(
             "hbm_write",
         ]
     )
+    selected = {
+        "id": selected_path,
+        "engine_count": 1,
+        "max_priority_burst": 4,
+        "max_in_flight_page_movements": 1,
+        "resource_ids": resources,
+        "contract_status": "compatibility_checkpoint",
+    }
+    if implemented_contract:
+        segments = (
+            [
+                {
+                    "id": "base-dma",
+                    "kind": "bandwidth_resource",
+                    "resource_ref": "base-die-dma",
+                    "operation": "read",
+                    "byte_rule": "payload",
+                },
+                {
+                    "id": "local-fabric",
+                    "kind": "bandwidth_resource",
+                    "resource_ref": "local-stack-fabric",
+                    "operation": "write",
+                    "byte_rule": "payload",
+                },
+            ]
+            if selected_path == "base_die_local"
+            else [
+                {
+                    "id": "base-to-gpu",
+                    "kind": "ucie_transaction",
+                    "resource_ref": "ucie-frontside",
+                    "operation": "read",
+                    "byte_rule": "payload",
+                },
+                {
+                    "id": "gpu-dma",
+                    "kind": "bandwidth_resource",
+                    "resource_ref": "gpu-dma",
+                    "operation": "write",
+                    "byte_rule": "payload",
+                },
+                {
+                    "id": "gpu-to-base",
+                    "kind": "ucie_transaction",
+                    "resource_ref": "ucie-frontside",
+                    "operation": "write",
+                    "byte_rule": "payload",
+                },
+            ]
+        )
+        selected.update(
+            {
+                "schema_version": "movement-path-v1",
+                "contract_status": "implemented",
+                "timing_provenance": "estimated",
+                "segments": segments,
+                "resource_ids": [
+                    "lpddr_read",
+                    *(f"{item['id']}:{item['resource_ref']}" for item in segments),
+                    "hbm_write",
+                ],
+            }
+        )
     path.write_text(
         json.dumps(
             {
@@ -300,13 +365,7 @@ def _write_movement_events(
                 "run_id": "test-run",
                 "instance_id": "instance-0",
                 "manifest_digest": digest,
-                "selected_path": {
-                    "id": selected_path,
-                    "engine_count": 1,
-                    "max_priority_burst": 4,
-                    "max_in_flight_page_movements": 1,
-                    "resource_ids": resources,
-                },
+                "selected_path": selected,
                 "events": [
                     {
                         "event_id": "critical-0",
@@ -394,6 +453,50 @@ def test_memory_events_add_logical_nodes_and_only_true_consumer_waits(
     )
     assert _uint_attr(critical, "movement_expected_residency_version") == 0
     assert _uint_attr(critical, "movement_home_domain_id") == 0
+
+
+def test_implemented_path_contract_is_carried_to_et(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "tiers.json"
+    digest = _write_native_manifest(manifest_path)
+    events_path = tmp_path / "memory-events.json"
+    _write_movement_events(
+        events_path,
+        digest,
+        selected_path="gpu_routed",
+        implemented_contract=True,
+    )
+    trace = tmp_path / "native.txt"
+    _write_trace(
+        trace,
+        [_native_layer("block0_layernorm"), _native_layer("unrelated")],
+        pp_size=1,
+        header_suffix=(
+            f"  trace_schema: llm-tier-v1  tier_manifest_digest: {digest}"
+        ),
+    )
+
+    outputs = LLMConverter(
+        str(trace),
+        str(tmp_path / "llm"),
+        num_npus=1,
+        tier_manifest=str(manifest_path),
+        memory_events=str(events_path),
+    ).convert()
+
+    _, nodes = _read_et(outputs[0])
+    movement = next(
+        node for node in nodes if node.name == "MEMORY_MOVEMENT_critical-0"
+    )
+    assert _string_attr(movement, "movement_path_schema_version") == (
+        "movement-path-v1"
+    )
+    assert _string_attr(movement, "movement_path_contract_status") == "implemented"
+    assert _string_attr(movement, "movement_path_timing_provenance") == "estimated"
+    assert next(
+        attr.string_list.values
+        for attr in movement.attr
+        if attr.name == "movement_segment_kinds"
+    ) == ["ucie_transaction", "bandwidth_resource", "ucie_transaction"]
 
 
 def test_memory_events_fail_closed_on_cross_pair_and_digest(tmp_path: Path) -> None:

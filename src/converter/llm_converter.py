@@ -488,6 +488,18 @@ class LLMConverter:
                         string_val=self.movement_events.path_id,
                     ),
                     ChakraAttr(
+                        name="movement_path_schema_version",
+                        string_val=self.movement_events.path_schema_version,
+                    ),
+                    ChakraAttr(
+                        name="movement_path_contract_status",
+                        string_val=self.movement_events.path_contract_status,
+                    ),
+                    ChakraAttr(
+                        name="movement_path_timing_provenance",
+                        string_val=self.movement_events.path_timing_provenance,
+                    ),
+                    ChakraAttr(
                         name="movement_engine_count",
                         uint32_val=self.movement_events.engine_count,
                     ),
@@ -511,6 +523,39 @@ class LLMConverter:
                     ),
                     self._string_list_attr(
                         "movement_resource_ids", self.movement_events.resource_ids
+                    ),
+                    self._string_list_attr(
+                        "movement_segment_ids",
+                        tuple(
+                            item.id for item in self.movement_events.path_segments
+                        ),
+                    ),
+                    self._string_list_attr(
+                        "movement_segment_kinds",
+                        tuple(
+                            item.kind for item in self.movement_events.path_segments
+                        ),
+                    ),
+                    self._string_list_attr(
+                        "movement_segment_resource_refs",
+                        tuple(
+                            item.resource_ref
+                            for item in self.movement_events.path_segments
+                        ),
+                    ),
+                    self._string_list_attr(
+                        "movement_segment_operations",
+                        tuple(
+                            item.operation
+                            for item in self.movement_events.path_segments
+                        ),
+                    ),
+                    self._string_list_attr(
+                        "movement_segment_byte_rules",
+                        tuple(
+                            item.byte_rule
+                            for item in self.movement_events.path_segments
+                        ),
                     ),
                     self._string_list_attr(
                         "movement_dependencies", event.depends_on

@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 SCHEMA_VERSION = "memory-events-v1"
+PATH_SCHEMA_VERSION = "movement-path-v1"
 _PATH_RESOURCES = {
     "base_die_local": (
         "lpddr_read",
@@ -69,6 +70,19 @@ class Endpoint:
 
 
 @dataclass(frozen=True)
+class PathSegment:
+    id: str
+    kind: str
+    resource_ref: str
+    operation: str
+    byte_rule: str
+
+    @property
+    def bill_id(self):
+        return f"{self.id}:{self.resource_ref}"
+
+
+@dataclass(frozen=True)
 class MovementEvent:
     event_id: str
     page_id: str | None
@@ -124,6 +138,10 @@ class MemoryEvents:
                 "max_priority_burst",
                 "max_in_flight_page_movements",
                 "resource_ids",
+                "contract_status",
+                "schema_version",
+                "timing_provenance",
+                "segments",
             },
             "selected_path",
         )
@@ -149,11 +167,102 @@ class MemoryEvents:
         self.resource_ids = _unique_strings(
             selected.get("resource_ids"), "selected_path.resource_ids"
         )
-        for required in _PATH_RESOURCES[self.path_id]:
-            if not any(required in resource for resource in self.resource_ids):
+        self.path_contract_status = selected.get(
+            "contract_status", "compatibility_checkpoint"
+        )
+        if self.path_contract_status == "implemented":
+            if selected.get("schema_version") != PATH_SCHEMA_VERSION:
                 raise ValueError(
-                    f"selected_path.resource_ids is missing {required!r}"
+                    f"selected_path.schema_version must be {PATH_SCHEMA_VERSION}"
                 )
+            self.path_schema_version = PATH_SCHEMA_VERSION
+            self.path_timing_provenance = selected.get("timing_provenance")
+            if self.path_timing_provenance not in {"estimated", "measured"}:
+                raise ValueError(
+                    "selected_path.timing_provenance must be estimated or measured"
+                )
+            raw_segments = selected.get("segments")
+            if not isinstance(raw_segments, list) or not raw_segments:
+                raise ValueError("selected_path.segments must be a non-empty array")
+            segments = []
+            for index, raw in enumerate(raw_segments):
+                context = f"selected_path.segments[{index}]"
+                _closed_object(
+                    raw,
+                    {"id", "kind", "resource_ref", "operation", "byte_rule"},
+                    context,
+                )
+                for field in ("id", "resource_ref"):
+                    if not isinstance(raw.get(field), str) or not raw[field]:
+                        raise ValueError(f"{context}.{field} must be non-empty")
+                if raw.get("kind") not in {
+                    "bandwidth_resource",
+                    "ucie_transaction",
+                }:
+                    raise ValueError(f"{context}.kind is unsupported")
+                if raw.get("operation") not in {"read", "write"}:
+                    raise ValueError(f"{context}.operation is unsupported")
+                if raw.get("byte_rule") != "payload":
+                    raise ValueError(f"{context}.byte_rule must be payload")
+                segments.append(
+                    PathSegment(
+                        raw["id"],
+                        raw["kind"],
+                        raw["resource_ref"],
+                        raw["operation"],
+                        raw["byte_rule"],
+                    )
+                )
+            if len({segment.id for segment in segments}) != len(segments):
+                raise ValueError("selected_path segment IDs must be unique")
+            shape = tuple((item.kind, item.operation) for item in segments)
+            expected_shape = (
+                (
+                    ("bandwidth_resource", "read"),
+                    ("bandwidth_resource", "write"),
+                )
+                if self.path_id == "base_die_local"
+                else (
+                    ("ucie_transaction", "read"),
+                    ("bandwidth_resource", "write"),
+                    ("ucie_transaction", "write"),
+                )
+            )
+            if shape != expected_shape:
+                raise ValueError(
+                    f"selected_path {self.path_id} segments have invalid shape"
+                )
+            self.path_segments = tuple(segments)
+            expected_resources = (
+                "lpddr_read",
+                *(segment.bill_id for segment in self.path_segments),
+                "hbm_write",
+            )
+            if self.resource_ids != expected_resources:
+                raise ValueError(
+                    "selected_path.resource_ids must match ordered segments"
+                )
+        elif self.path_contract_status == "compatibility_checkpoint":
+            if any(
+                selected.get(field) is not None
+                for field in ("schema_version", "timing_provenance", "segments")
+            ):
+                raise ValueError(
+                    "compatibility checkpoint must not claim implemented path fields"
+                )
+            self.path_schema_version = "adr-0020-checkpoint"
+            self.path_timing_provenance = "proxy_unimplemented"
+            self.path_segments = ()
+            for required in _PATH_RESOURCES[self.path_id]:
+                if not any(required in resource for resource in self.resource_ids):
+                    raise ValueError(
+                        f"selected_path.resource_ids is missing {required!r}"
+                    )
+        else:
+            raise ValueError(
+                "selected_path.contract_status must be implemented or "
+                "compatibility_checkpoint"
+            )
 
         raw_events = payload.get("events")
         if not isinstance(raw_events, list):
