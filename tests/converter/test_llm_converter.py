@@ -272,6 +272,199 @@ def _uint_attr(node: Node, name: str) -> int:
     return next(attr.uint32_val for attr in node.attr if attr.name == name)
 
 
+def _write_movement_events(
+    path: Path,
+    digest: str,
+    *,
+    selected_path: str = "base_die_local",
+) -> None:
+    resources = (
+        ["lpddr_read", "base_die_dma", "local_stack_fabric", "hbm_write"]
+        if selected_path == "base_die_local"
+        else [
+            "lpddr_read",
+            "base_to_gpu_link",
+            "gpu_dma",
+            "gpu_to_base_link",
+            "hbm_write",
+        ]
+    )
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "memory-events-v1",
+                "run_id": "test-run",
+                "instance_id": "instance-0",
+                "manifest_digest": digest,
+                "selected_path": {
+                    "id": selected_path,
+                    "engine_count": 1,
+                    "max_priority_burst": 4,
+                    "max_in_flight_page_movements": 1,
+                    "resource_ids": resources,
+                },
+                "events": [
+                    {
+                        "event_id": "critical-0",
+                        "source_iteration_id": 0,
+                        "npu_id": 0,
+                        "kind": "page_promote",
+                        "phase": "critical_line",
+                        "source": {"tier_id": 17, "device_id": 0},
+                        "destination": {"tier_id": 16, "device_id": 0},
+                        "bytes": 4096,
+                        "priority_class": "decode_critical",
+                        "depends_on": [],
+                        "releases": ["block0_layernorm"],
+                    },
+                    {
+                        "event_id": "background-0",
+                        "source_iteration_id": 0,
+                        "npu_id": 0,
+                        "kind": "page_promote",
+                        "phase": "background_fill",
+                        "source": {"tier_id": 17, "device_id": 0},
+                        "destination": {"tier_id": 16, "device_id": 0},
+                        "bytes": 2 * 1024 * 1024,
+                        "priority_class": "background_fill",
+                        "depends_on": ["critical-0"],
+                        "releases": [],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_memory_events_add_logical_nodes_and_only_true_consumer_waits(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "tiers.json"
+    digest = _write_native_manifest(manifest_path)
+    events_path = tmp_path / "memory-events.json"
+    _write_movement_events(events_path, digest)
+    trace = tmp_path / "native.txt"
+    rows = [_native_layer("block0_layernorm"), _native_layer("unrelated")]
+    _write_trace(
+        trace,
+        rows,
+        pp_size=1,
+        header_suffix=(
+            f"  trace_schema: llm-tier-v1  tier_manifest_digest: {digest}"
+        ),
+    )
+
+    outputs = LLMConverter(
+        str(trace),
+        str(tmp_path / "llm"),
+        num_npus=1,
+        tier_manifest=str(manifest_path),
+        memory_events=str(events_path),
+    ).convert()
+
+    _, nodes = _read_et(outputs[0])
+    movement = {node.name: node for node in nodes if node.name.startswith("MEMORY_MOVEMENT")}
+    critical = movement["MEMORY_MOVEMENT_critical-0"]
+    background = movement["MEMORY_MOVEMENT_background-0"]
+    consumer = next(node for node in nodes if node.name == "COMP_NODE_block0_layernorm")
+    unrelated = next(node for node in nodes if node.name == "COMP_NODE_unrelated")
+    assert critical.id in consumer.data_deps
+    assert critical.id not in unrelated.data_deps
+    assert background.id not in consumer.data_deps
+    assert _uint_attr(critical, "movement_source_iteration_id") == 0
+    assert (
+        _uint_attr(critical, "movement_max_in_flight_page_movements") == 1
+    )
+
+
+def test_memory_events_fail_closed_on_cross_pair_and_digest(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "tiers.json"
+    digest = _write_native_manifest(manifest_path)
+    events_path = tmp_path / "memory-events.json"
+    _write_movement_events(events_path, digest)
+    payload = json.loads(events_path.read_text(encoding="utf-8"))
+    payload["events"][0]["destination"]["device_id"] = 1
+    events_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="paired HBM"):
+        LLMConverter(
+            "unused",
+            "unused",
+            num_npus=1,
+            tier_manifest=str(manifest_path),
+            memory_events=str(events_path),
+        )
+
+    _write_movement_events(events_path, f"sha256:{'0' * 64}")
+    with pytest.raises(ValueError, match="manifest_digest"):
+        LLMConverter(
+            "unused",
+            "unused",
+            num_npus=1,
+            tier_manifest=str(manifest_path),
+            memory_events=str(events_path),
+        )
+
+
+def test_memory_events_reject_page_limit_above_engine_count(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "tiers.json"
+    digest = _write_native_manifest(manifest_path)
+    events_path = tmp_path / "memory-events.json"
+    _write_movement_events(events_path, digest)
+    payload = json.loads(events_path.read_text(encoding="utf-8"))
+    payload["selected_path"]["max_in_flight_page_movements"] = 2
+    events_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must not exceed engine_count"):
+        LLMConverter(
+            "unused",
+            "unused",
+            num_npus=1,
+            tier_manifest=str(manifest_path),
+            memory_events=str(events_path),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("npu_id", 99, "no output ET"),
+        ("releases", ["missing_layer"], "do not name emitted compute"),
+    ],
+)
+def test_memory_events_reject_unconsumed_targets(
+    tmp_path: Path,
+    field: str,
+    value,
+    message: str,
+) -> None:
+    manifest_path = tmp_path / "tiers.json"
+    digest = _write_native_manifest(manifest_path)
+    events_path = tmp_path / "memory-events.json"
+    _write_movement_events(events_path, digest)
+    payload = json.loads(events_path.read_text(encoding="utf-8"))
+    payload["events"][0][field] = value
+    events_path.write_text(json.dumps(payload), encoding="utf-8")
+    trace = tmp_path / "native.txt"
+    _write_trace(
+        trace,
+        [_native_layer("block0_layernorm"), _native_layer("unrelated")],
+        pp_size=1,
+        header_suffix=(
+            f"  trace_schema: llm-tier-v1  tier_manifest_digest: {digest}"
+        ),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        LLMConverter(
+            str(trace),
+            str(tmp_path / "llm"),
+            num_npus=1,
+            tier_manifest=str(manifest_path),
+            memory_events=str(events_path),
+        ).convert()
+
 def test_native_segments_emit_one_compute_with_multiple_load_parents(
     tmp_path: Path,
 ) -> None:

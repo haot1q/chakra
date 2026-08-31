@@ -10,6 +10,7 @@ from ...schema.protobuf.et_def_pb2 import *
 from ...schema.protobuf.et_def_pb2 import AttributeProto as ChakraAttr
 from ..third_party.utils.protolib import encodeMessage as encode_message
 from .et_validator import validate_et_group
+from .memory_events import MemoryEvents
 from .tier_manifest import TierManifest
 
 
@@ -143,7 +144,7 @@ class Layer:
             involved_dim = [v == '1' for v in dim_str.split(',')]
             return comm_type, involved_dim
         return s, None
-        
+
 class LLMConverter:
     def __init__(
         self,
@@ -153,6 +154,7 @@ class LLMConverter:
         npu_offset: int = 0,
         local_offloading: bool = False,
         tier_manifest: str | None = None,
+        memory_events: str | None = None,
     ):
         self.input_filename = input_filename
         self.output_filename = output_filename
@@ -160,6 +162,15 @@ class LLMConverter:
         self.npu_offset = npu_offset
         self.local_offloading = local_offloading
         self.manifest = TierManifest(tier_manifest) if tier_manifest else None
+        if memory_events and self.manifest is None:
+            raise ValueError("--memory-events requires --tier-manifest")
+        self.movement_events = (
+            MemoryEvents(memory_events, self.manifest.digest)
+            if memory_events
+            else None
+        )
+        self._emitted_movement_event_ids: set[str] = set()
+        self._emitted_movement_releases: set[tuple[str, str]] = set()
         self.native_trace = False
         self.next_node_id = 0
 
@@ -201,9 +212,9 @@ class LLMConverter:
             )
         metadata = GlobalMetadata(attr=attr)
         return metadata
-    
+
     def get_layers(self, f: TextIOWrapper) -> List[Layer]:
-        if self._layers is not None:
+        if getattr(self, "_layers", None) is not None:
             return self._layers
         layers: List[Layer] = []
         for line in f:
@@ -264,7 +275,7 @@ class LLMConverter:
         ret = self.next_node_id
         self.next_node_id += 1
         return ret
-    
+
     def get_next_comm_tag(self) -> int:
         ret = self.next_comm_tag
         self.next_comm_tag += 1
@@ -281,7 +292,7 @@ class LLMConverter:
         node = self.get_node("COMP_NODE_" + layer_name, COMP_NODE)
         node.duration_micros = comp_time
         return node
-    
+
     def get_comm_type(self, comm_type: str) -> int:
         if comm_type == "ALLREDUCE":
             return ALL_REDUCE
@@ -292,7 +303,7 @@ class LLMConverter:
         elif comm_type == "REDUCESCATTER":
             return REDUCE_SCATTER
         return 0
-    
+
     def get_comm_coll_node(self, layer_name: str, comm_type: str, comm_size: int,
                            involved_dim: list = None) -> Any:
         node = self.get_node(f"COMM_COLL_NODE_{layer_name}_{comm_type}", COMM_COLL_NODE)
@@ -328,7 +339,7 @@ class LLMConverter:
         # check if SEND/RECV pair have same tags
         # print(f"name: {node.name}, src: {node.comm_src}, dst: {node.comm_dst}, size: {node.comm_size}, key: {comm_key}, tag: {node.comm_tag}")
         return node
-    
+
     def get_mem_type(self, mem_type: str) -> int:
         if self.native_trace:
             return self.manifest.resolve(mem_type)[0]
@@ -342,7 +353,7 @@ class LLMConverter:
         elif mem_type == "STORAGE":
             return MemoryType.STORAGE_MEMORY.value
         return MemoryType.INVALID_MEMORY.value
-    
+
     def get_mem_device(self, mem_type: str) -> int:
         """
         Extract the device index from mem_type.
@@ -405,9 +416,126 @@ class LLMConverter:
         node.attr.append(ChakraAttr(name="tensor_device", uint32_val=self.get_mem_device(mem_type)))
         node.attr.append(ChakraAttr(name="tensor_channel", uint32_val=self.get_mem_channel(mem_type)))
         return node
-        
+
     def add_parent(self, child_node: Any, parent_node: Any) -> None:
         child_node.data_deps.append(parent_node.id)
+
+    @staticmethod
+    def _string_list_attr(name: str, values: tuple[str, ...]) -> ChakraAttr:
+        return ChakraAttr(name=name, string_list=StringList(values=values))
+
+    def get_memory_movement_nodes(self, npu_id: int) -> dict[str, tuple[Any, Any]]:
+        if self.movement_events is None:
+            return {}
+        nodes = {}
+        for event in self.movement_events.events_for_npu(npu_id):
+            if event.event_id in self._emitted_movement_event_ids:
+                raise ValueError(
+                    f"movement event {event.event_id!r} was emitted more than once"
+                )
+            self._emitted_movement_event_ids.add(event.event_id)
+            node = self.get_node(f"MEMORY_MOVEMENT_{event.event_id}", MEM_LOAD_NODE)
+            node.attr.extend(
+                [
+                    ChakraAttr(name="tensor_size", uint64_val=event.bytes),
+                    ChakraAttr(name="tensor_loc", uint32_val=event.source.tier_id),
+                    ChakraAttr(name="tensor_device", uint32_val=event.source.device_id),
+                    ChakraAttr(
+                        name="memory_movement_schema_version",
+                        string_val="memory-events-v1",
+                    ),
+                    ChakraAttr(
+                        name="memory_movement_manifest_digest",
+                        string_val=self.movement_events.manifest_digest,
+                    ),
+                    ChakraAttr(
+                        name="movement_run_id",
+                        string_val=self.movement_events.run_id,
+                    ),
+                    ChakraAttr(
+                        name="movement_instance_id",
+                        string_val=self.movement_events.instance_id,
+                    ),
+                    ChakraAttr(name="movement_event_id", string_val=event.event_id),
+                    ChakraAttr(
+                        name="movement_source_iteration_id",
+                        uint32_val=event.source_iteration_id,
+                    ),
+                    ChakraAttr(name="movement_kind", string_val=event.kind),
+                    ChakraAttr(name="movement_phase", string_val=event.phase),
+                    ChakraAttr(
+                        name="movement_priority_class",
+                        string_val=event.priority_class,
+                    ),
+                    ChakraAttr(
+                        name="movement_path_id",
+                        string_val=self.movement_events.path_id,
+                    ),
+                    ChakraAttr(
+                        name="movement_engine_count",
+                        uint32_val=self.movement_events.engine_count,
+                    ),
+                    ChakraAttr(
+                        name="movement_max_priority_burst",
+                        uint32_val=self.movement_events.max_priority_burst,
+                    ),
+                    ChakraAttr(
+                        name="movement_max_in_flight_page_movements",
+                        uint32_val=(
+                            self.movement_events.max_in_flight_page_movements
+                        ),
+                    ),
+                    ChakraAttr(
+                        name="movement_destination_tier_id",
+                        uint32_val=event.destination.tier_id,
+                    ),
+                    ChakraAttr(
+                        name="movement_destination_device_id",
+                        uint32_val=event.destination.device_id,
+                    ),
+                    self._string_list_attr(
+                        "movement_resource_ids", self.movement_events.resource_ids
+                    ),
+                    self._string_list_attr(
+                        "movement_dependencies", event.depends_on
+                    ),
+                ]
+            )
+            nodes[event.event_id] = (event, node)
+        return nodes
+
+    def add_memory_movement_parents(
+        self,
+        comp_node: Any,
+        layer_name: str,
+        movement_nodes: dict[str, tuple[Any, Any]],
+    ) -> None:
+        for event, movement_node in movement_nodes.values():
+            if layer_name in event.releases:
+                self.add_parent(comp_node, movement_node)
+                self._emitted_movement_releases.add((event.event_id, layer_name))
+
+    def validate_movement_emission(self) -> None:
+        if self.movement_events is None:
+            return
+        expected_events = {
+            event.event_id for event in self.movement_events.events
+        }
+        if self._emitted_movement_event_ids != expected_events:
+            missing = sorted(expected_events - self._emitted_movement_event_ids)
+            raise ValueError(
+                f"memory movement events target NPUs with no output ET: {missing}"
+            )
+        expected_releases = {
+            (event.event_id, layer_name)
+            for event in self.movement_events.events
+            for layer_name in event.releases
+        }
+        if self._emitted_movement_releases != expected_releases:
+            missing = sorted(expected_releases - self._emitted_movement_releases)
+            raise ValueError(
+                f"memory movement releases do not name emitted compute nodes: {missing}"
+            )
 
     def get_weight_load_nodes(self, layer: Layer) -> List[Any]:
         if layer.weight_segments:
@@ -550,7 +678,7 @@ class LLMConverter:
             else:
                 continue
             ev_ld_cnt += 1
-            
+
         layers = layers[ev_ld_cnt:]
         num_layers -= ev_ld_cnt
 
@@ -572,12 +700,15 @@ class LLMConverter:
                 layer_start, layer_end = stage_edges[npu_group]
                 self._reset_layer_state(layers)
                 npu_id = npu_group * npus_per_group + npu_offset + self.npu_offset
+                movement_nodes = self.get_memory_movement_nodes(npu_id)
                 output_filename = "%s.%d.et" % (self.output_filename, npu_id)
                 output_paths.append(Path(output_filename))
                 first_comp_node = True
                 with open(output_filename, "wb") as g:
                     global_metadata = self.get_global_metadata()
                     encode_message(g, global_metadata)
+                    for _, movement_node in movement_nodes.values():
+                        encode_message(g, movement_node)
                     if evict != None:
                         encode_message(g, evict)
                     if load != None:
@@ -590,7 +721,7 @@ class LLMConverter:
                             layers[layer_start].input_memory_loc,
                             layers[layer_start].input_memory_size,
                         )
-                        encode_message(g, input_load_node)                  
+                        encode_message(g, input_load_node)
                     else:
                         if layers[layer_start].is_expert or layers[layer_start].is_pim:
                             # Receive input (from the previous layer in another npu group)
@@ -624,7 +755,7 @@ class LLMConverter:
                     last_batch_type = "BATCH_1"
                     layer_num = layer_start
                     while expert_start or pim_start or attn_remain or layer_num < layer_end:
-                        if not layers[layer_num].is_expert and not layers[layer_num].is_pim: 
+                        if not layers[layer_num].is_expert and not layers[layer_num].is_pim:
                             layers[layer_num].weight_memory_nodes = (
                                 self.get_weight_load_nodes(layers[layer_num])
                             )
@@ -635,20 +766,25 @@ class LLMConverter:
                             # Compute
                             if layers[layer_num].comp_time != 0 and not pim_start: # pim computation is handled pim_comp_node
                                 comp_node = self.get_comp_node(
-                                    layers[layer_num].name, 
+                                    layers[layer_num].name,
                                     layers[layer_num].comp_time)
                                 layers[layer_num].comp_node = comp_node
+                                self.add_memory_movement_parents(
+                                    comp_node,
+                                    layers[layer_num].name,
+                                    movement_nodes,
+                                )
 
                                 # handle pim parent nodes, and if prefill attention remains wait until all attention is done (before o_proj)
                                 if len(pim_parent_nodes) != 0:
                                     if attn_remain:
-                                        for parent in pim_parent_nodes: 
+                                        for parent in pim_parent_nodes:
                                             self.add_parent(comp_node, parent)
                                     pim_parent_nodes = [] # reset pim parent nodes
 
                                     if "attn" in layers[layer_num].name:
                                         attn_remain = False
-                                else: 
+                                else:
                                     if first_comp_node:
                                         if npu_group == 0:
                                             self.add_parent(comp_node, input_load_node)
@@ -715,7 +851,7 @@ class LLMConverter:
                         # expert layer starts
                         elif layers[layer_num].is_expert:
                             # communication can happen even with one NPU in the group, for example, expert input gathering in data parallel
-                            if expert_start == False and layers[layer_num].comm_size > 0 and layers[layer_num].comm_type != "NONE": 
+                            if expert_start == False and layers[layer_num].comm_size > 0 and layers[layer_num].comm_type != "NONE":
                                 # Start of expert, add ALLTOALL communication before expert computation
                                 comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num].comm_size, layers[layer_num].involved_dim)
                                 layers[layer_num].comm_node = comm_coll_node
@@ -860,7 +996,7 @@ class LLMConverter:
                             self.add_parent(send_output_node, layers[layer_end - 2].comp_node)
                         encode_message(g, send_output_node)
         return output_paths
-    
+
     def convert_prefill(self, f: TextIOWrapper, num_layers: int, num_npu_group: int,
                         stage_boundaries: List[int] = None):
         layers: list[Layer] = self.get_layers(f)
@@ -892,7 +1028,7 @@ class LLMConverter:
             else:
                 continue
             ev_ld_cnt += 1
-            
+
         layers = layers[ev_ld_cnt:]
         num_layers -= ev_ld_cnt
 
@@ -914,6 +1050,7 @@ class LLMConverter:
                 layer_start, layer_end = stage_edges[npu_group]
                 self._reset_layer_state(layers)
                 npu_id = npu_group * npus_per_group + npu_offset + self.npu_offset
+                movement_nodes = self.get_memory_movement_nodes(npu_id)
                 output_filename1 = "%s.%d.et" % (self.output_filename, npu_id)
                 output_filename2 = "%s.%d.et" % (self.output_filename, npu_id + self.num_npus) # sender for prefill-decode
                 output_paths.extend((Path(output_filename1), Path(output_filename2)))
@@ -922,6 +1059,8 @@ class LLMConverter:
                     global_metadata = self.get_global_metadata()
                     encode_message(g, global_metadata)
                     encode_message(s, global_metadata)
+                    for _, movement_node in movement_nodes.values():
+                        encode_message(g, movement_node)
                     if evict != None:
                         encode_message(g, evict)
                     if load != None:
@@ -934,7 +1073,7 @@ class LLMConverter:
                             layers[layer_start].input_memory_loc,
                             layers[layer_start].input_memory_size,
                         )
-                        encode_message(g, input_load_node)                  
+                        encode_message(g, input_load_node)
                     else:
                         if layers[layer_start].is_expert:
                             # Receive input (from the previous layer in another npu group)
@@ -970,13 +1109,18 @@ class LLMConverter:
                                 if expert_start:
                                     self.add_parent(weight_load_node, comp_node)
                                 encode_message(g, weight_load_node)
-                            
+
                             # Compute
                             if layers[layer_num].comp_time != 0:
                                 comp_node = self.get_comp_node(
-                                    layers[layer_num].name, 
+                                    layers[layer_num].name,
                                     layers[layer_num].comp_time)
                                 layers[layer_num].comp_node = comp_node
+                                self.add_memory_movement_parents(
+                                    comp_node,
+                                    layers[layer_num].name,
+                                    movement_nodes,
+                                )
 
                                 if first_comp_node:
                                     if npu_group == 0:
@@ -999,7 +1143,7 @@ class LLMConverter:
                                         self.add_parent(comp_node, layers[layer_num - 1].comp_node)
                                     else:
                                         self.add_parent(comp_node, layers[layer_num - 2].comp_node)
-                                
+
                                 encode_message(g, comp_node)
 
                                 # Send KV cache after each kv_proj.
@@ -1049,7 +1193,7 @@ class LLMConverter:
                         # expert layer starts
                         elif layers[layer_num].is_expert:
                             # communication can happen even with one NPU in the group, for example, expert input gathering in data parallel
-                            if expert_start == False and layers[layer_num].comm_size > 0 and layers[layer_num].comm_type != "NONE": 
+                            if expert_start == False and layers[layer_num].comm_size > 0 and layers[layer_num].comm_type != "NONE":
                                 # Start of expert, add ALLTOALL communication before expert computation
                                 comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num].comm_size, layers[layer_num].involved_dim)
                                 layers[layer_num].comm_node = comm_coll_node
@@ -1150,20 +1294,26 @@ class LLMConverter:
             )
         output_paths = []
         for npu_id in range(self.num_npus):
+            movement_nodes = self.get_memory_movement_nodes(npu_id)
             output_filename = "%s.%d.et" % (self.output_filename, npu_id)
             output_paths.append(Path(output_filename))
             with open(output_filename, "wb") as g:
                 global_metadata = self.get_global_metadata()
                 encode_message(g, global_metadata)
+                for _, movement_node in movement_nodes.values():
+                    encode_message(g, movement_node)
                 for idx, layer in enumerate(layers):
-                    comp_node = self.get_comp_node(
-                    layer.name, 
-                    layer.comp_time)
+                    comp_node = self.get_comp_node(layer.name, layer.comp_time)
                     layer.comp_node = comp_node
+                    self.add_memory_movement_parents(
+                        comp_node, layer.name, movement_nodes
+                    )
                     encode_message(g, comp_node)
         return output_paths
 
     def convert(self):
+        self._emitted_movement_event_ids.clear()
+        self._emitted_movement_releases.clear()
         with open(self.input_filename, "r") as f:
             execution_type, header = _parse_trace_header(f.readline())
             trace_schema = header.get("trace_schema")
@@ -1222,5 +1372,6 @@ class LLMConverter:
                 outputs = self.convert_event(f, num_layers)
             else:
                 raise ValueError(f"Unsupported execution type, {execution_type}")
+        self.validate_movement_emission()
         validate_et_group(outputs)
         return outputs
