@@ -71,6 +71,9 @@ class Endpoint:
 @dataclass(frozen=True)
 class MovementEvent:
     event_id: str
+    page_id: str | None
+    transaction_id: str | None
+    expected_residency_version: int | None
     source_iteration_id: int
     npu_id: int
     kind: str
@@ -162,6 +165,9 @@ class MemoryEvents:
                 raw,
                 {
                     "event_id",
+                    "page_id",
+                    "transaction_id",
+                    "expected_residency_version",
                     "source_iteration_id",
                     "npu_id",
                     "kind",
@@ -190,6 +196,24 @@ class MemoryEvents:
             kind = raw.get("kind")
             if kind not in {"load", "store", "page_promote", "page_demote"}:
                 raise ValueError(f"{context}.kind is unsupported")
+            page_id = raw.get("page_id")
+            transaction_id = raw.get("transaction_id")
+            expected_version = raw.get("expected_residency_version")
+            if kind in {"page_promote", "page_demote"}:
+                if not isinstance(page_id, str) or not page_id:
+                    raise ValueError(f"{context}.page_id must be non-empty")
+                if not isinstance(transaction_id, str) or not transaction_id:
+                    raise ValueError(f"{context}.transaction_id must be non-empty")
+                expected_version = _non_negative_int(
+                    expected_version, f"{context}.expected_residency_version"
+                )
+            elif any(
+                value is not None
+                for value in (page_id, transaction_id, expected_version)
+            ):
+                raise ValueError(
+                    f"{context} non-page movement must not carry page identity"
+                )
             phase = raw.get("phase")
             if phase not in {"critical_line", "background_fill", "whole_object"}:
                 raise ValueError(f"{context}.phase is unsupported")
@@ -206,6 +230,9 @@ class MemoryEvents:
             events.append(
                 MovementEvent(
                     event_id=event_id,
+                    page_id=page_id,
+                    transaction_id=transaction_id,
+                    expected_residency_version=expected_version,
                     source_iteration_id=_non_negative_int(
                         raw.get("source_iteration_id"),
                         f"{context}.source_iteration_id",

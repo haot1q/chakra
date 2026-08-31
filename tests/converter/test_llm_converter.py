@@ -272,6 +272,10 @@ def _uint_attr(node: Node, name: str) -> int:
     return next(attr.uint32_val for attr in node.attr if attr.name == name)
 
 
+def _string_attr(node: Node, name: str) -> str:
+    return next(attr.string_val for attr in node.attr if attr.name == name)
+
+
 def _write_movement_events(
     path: Path,
     digest: str,
@@ -306,6 +310,9 @@ def _write_movement_events(
                 "events": [
                     {
                         "event_id": "critical-0",
+                        "page_id": "page-v1:" + "1" * 64,
+                        "transaction_id": "promote-00000001-page",
+                        "expected_residency_version": 0,
                         "source_iteration_id": 0,
                         "npu_id": 0,
                         "kind": "page_promote",
@@ -319,6 +326,9 @@ def _write_movement_events(
                     },
                     {
                         "event_id": "background-0",
+                        "page_id": "page-v1:" + "1" * 64,
+                        "transaction_id": "promote-00000001-page",
+                        "expected_residency_version": 0,
                         "source_iteration_id": 0,
                         "npu_id": 0,
                         "kind": "page_promote",
@@ -376,6 +386,11 @@ def test_memory_events_add_logical_nodes_and_only_true_consumer_waits(
     assert (
         _uint_attr(critical, "movement_max_in_flight_page_movements") == 1
     )
+    assert _string_attr(critical, "movement_page_id") == "page-v1:" + "1" * 64
+    assert _string_attr(critical, "movement_transaction_id") == (
+        "promote-00000001-page"
+    )
+    assert _uint_attr(critical, "movement_expected_residency_version") == 0
 
 
 def test_memory_events_fail_closed_on_cross_pair_and_digest(tmp_path: Path) -> None:
@@ -398,6 +413,25 @@ def test_memory_events_fail_closed_on_cross_pair_and_digest(tmp_path: Path) -> N
 
     _write_movement_events(events_path, f"sha256:{'0' * 64}")
     with pytest.raises(ValueError, match="manifest_digest"):
+        LLMConverter(
+            "unused",
+            "unused",
+            num_npus=1,
+            tier_manifest=str(manifest_path),
+            memory_events=str(events_path),
+        )
+
+
+def test_page_memory_event_requires_transaction_identity(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "tiers.json"
+    digest = _write_native_manifest(manifest_path)
+    events_path = tmp_path / "memory-events.json"
+    _write_movement_events(events_path, digest)
+    payload = json.loads(events_path.read_text(encoding="utf-8"))
+    payload["events"][0].pop("transaction_id")
+    events_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="transaction_id must be non-empty"):
         LLMConverter(
             "unused",
             "unused",

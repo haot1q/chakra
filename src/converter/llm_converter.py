@@ -501,6 +501,22 @@ class LLMConverter:
                     ),
                 ]
             )
+            if event.page_id is not None:
+                node.attr.extend(
+                    [
+                        ChakraAttr(
+                            name="movement_page_id", string_val=event.page_id
+                        ),
+                        ChakraAttr(
+                            name="movement_transaction_id",
+                            string_val=event.transaction_id,
+                        ),
+                        ChakraAttr(
+                            name="movement_expected_residency_version",
+                            uint32_val=event.expected_residency_version,
+                        ),
+                    ]
+                )
             nodes[event.event_id] = (event, node)
         return nodes
 
