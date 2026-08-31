@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <queue>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -38,11 +39,14 @@ class ETFeeder {
   void readNextWindow();
   void resolveDep();
   void printGraph();
+  const std::string& tierManifestDigest() const;
+  bool hasTierManifestDigest() const;
 
  private:
   ProtoInputStream trace_;
   const uint32_t window_size_;
   bool et_complete_;
+  std::string tier_manifest_digest_;
 
   std::map<uint64_t, std::shared_ptr<ETFeederNode>> dep_graph_{};
   std::unordered_set<uint64_t> dep_free_node_id_set_{};

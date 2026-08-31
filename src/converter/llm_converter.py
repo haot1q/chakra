@@ -1,11 +1,35 @@
+from __future__ import annotations
+
 import logging
 from io import TextIOWrapper
+from pathlib import Path
 from typing import Any, List
 from enum import Enum
 
 from ...schema.protobuf.et_def_pb2 import *
 from ...schema.protobuf.et_def_pb2 import AttributeProto as ChakraAttr
 from ..third_party.utils.protolib import encodeMessage as encode_message
+from .et_validator import validate_et_group
+from .memory_events import MemoryEvents
+from .tier_manifest import TierManifest
+
+
+def _parse_trace_header(line: str) -> tuple[str, dict[str, str]]:
+    fields = line.strip().split()
+    if not fields:
+        raise ValueError("Trace header is empty")
+    if len(fields[1:]) % 2 != 0:
+        raise ValueError("Trace header must contain key: value pairs")
+
+    header = {}
+    for key, value in zip(fields[1::2], fields[2::2]):
+        if not key.endswith(":"):
+            raise ValueError(f"Malformed Trace header key {key!r}")
+        name = key[:-1]
+        if name in header:
+            raise ValueError(f"Duplicate Trace header key {name!r}")
+        header[name] = value
+    return fields[0], header
 
 
 # Memory type is deprecated for latest version of chakra & astra-sim
@@ -20,7 +44,12 @@ class MemoryType(Enum):
 
 
 class Layer:
-    def __init__(self, line: str = None, cols: List[str] = None):
+    def __init__(
+        self,
+        line: str | None = None,
+        manifest: TierManifest | None = None,
+        cols: List[str] | None = None,
+    ):
         try:
             # ``cols`` lets a caller that already holds the fields skip the
             # format-and-resplit round trip; ``line`` is the text path.
@@ -59,6 +88,7 @@ class Layer:
                 self.weight_memory_loc = str(col[4])
                 self.weight_memory_size = int(col[5])
                 self.weight_memory_node = None
+                self.weight_memory_nodes = []
                 self.output_memory_loc = str(col[6])
                 self.output_memory_size = int(col[7])
                 self.output_memory_node = None
@@ -69,8 +99,37 @@ class Layer:
                 self.comm_node = None
 
                 self.misc = str(col[10])
-        except:
-            raise ValueError(f"Cannot parse the following layer -- \"{line}\"")
+                self.weight_segments = []
+                if manifest is not None:
+                    if len(col) != 12:
+                        raise ValueError("native Trace rows must contain 12 columns")
+                    segment_text = col[11]
+                    if segment_text != "-":
+                        if self.weight_memory_size != 0:
+                            raise ValueError(
+                                "native multi-segment rows must set weight_size to 0"
+                            )
+                        previous_key = None
+                        seen_locations = set()
+                        for segment in segment_text.split(","):
+                            location, separator, raw_size = segment.partition("@")
+                            if not separator or not raw_size.isdigit() or int(raw_size) <= 0:
+                                raise ValueError(f"invalid weight segment {segment!r}")
+                            tier_id, device_id = manifest.resolve(location)
+                            key = (tier_id, device_id)
+                            if key in seen_locations:
+                                raise ValueError(f"duplicate weight segment {location!r}")
+                            if previous_key is not None and key <= previous_key:
+                                raise ValueError("weight segments must be sorted by tier_id/device_id")
+                            self.weight_segments.append((location, int(raw_size)))
+                            seen_locations.add(key)
+                            previous_key = key
+                elif len(col) != 11:
+                    raise ValueError("legacy Trace rows must contain 11 columns")
+        except (IndexError, KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"Cannot parse the following layer -- \"{line}\": {error}"
+            ) from error
 
     @staticmethod
     def _parse_comm_type(s: str):
@@ -85,7 +144,7 @@ class Layer:
             involved_dim = [v == '1' for v in dim_str.split(',')]
             return comm_type, involved_dim
         return s, None
-        
+
 class LLMConverter:
     def __init__(
         self,
@@ -94,12 +153,25 @@ class LLMConverter:
         num_npus: int,
         npu_offset: int = 0,
         local_offloading: bool = False,
+        tier_manifest: str | None = None,
+        memory_events: str | None = None,
     ):
         self.input_filename = input_filename
         self.output_filename = output_filename
         self.num_npus = num_npus
         self.npu_offset = npu_offset
         self.local_offloading = local_offloading
+        self.manifest = TierManifest(tier_manifest) if tier_manifest else None
+        if memory_events and self.manifest is None:
+            raise ValueError("--memory-events requires --tier-manifest")
+        self.movement_events = (
+            MemoryEvents(memory_events, self.manifest.digest)
+            if memory_events
+            else None
+        )
+        self._emitted_movement_event_ids: set[str] = set()
+        self._emitted_movement_releases: set[tuple[str, str]] = set()
+        self.native_trace = False
         self.next_node_id = 0
 
         # For send & recv nodes
@@ -131,15 +203,24 @@ class LLMConverter:
             ChakraAttr(name="schema", string_val="1.0.2-chakra.0.0.4"),
             ChakraAttr(name="input_file", string_val=self.input_filename),
         ]
+        if self.native_trace:
+            attr.append(
+                ChakraAttr(
+                    name="tier_manifest_digest",
+                    string_val=self.manifest.digest,
+                )
+            )
         metadata = GlobalMetadata(attr=attr)
         return metadata
-    
+
     def get_layers(self, f: TextIOWrapper) -> List[Layer]:
-        if self._layers is not None:
+        if getattr(self, "_layers", None) is not None:
             return self._layers
         layers: List[Layer] = []
         for line in f:
-            layers.append(Layer(line))
+            manifest = getattr(self, "manifest", None)
+            native_trace = getattr(self, "native_trace", False)
+            layers.append(Layer(line, manifest if native_trace else None))
         return layers
 
     def convert_rows(self, header_line: str, rows: List[List[str]]) -> None:
@@ -194,7 +275,7 @@ class LLMConverter:
         ret = self.next_node_id
         self.next_node_id += 1
         return ret
-    
+
     def get_next_comm_tag(self) -> int:
         ret = self.next_comm_tag
         self.next_comm_tag += 1
@@ -211,7 +292,7 @@ class LLMConverter:
         node = self.get_node("COMP_NODE_" + layer_name, COMP_NODE)
         node.duration_micros = comp_time
         return node
-    
+
     def get_comm_type(self, comm_type: str) -> int:
         if comm_type == "ALLREDUCE":
             return ALL_REDUCE
@@ -222,7 +303,7 @@ class LLMConverter:
         elif comm_type == "REDUCESCATTER":
             return REDUCE_SCATTER
         return 0
-    
+
     def get_comm_coll_node(self, layer_name: str, comm_type: str, comm_size: int,
                            involved_dim: list = None) -> Any:
         node = self.get_node(f"COMM_COLL_NODE_{layer_name}_{comm_type}", COMM_COLL_NODE)
@@ -258,8 +339,10 @@ class LLMConverter:
         # check if SEND/RECV pair have same tags
         # print(f"name: {node.name}, src: {node.comm_src}, dst: {node.comm_dst}, size: {node.comm_size}, key: {comm_key}, tag: {node.comm_tag}")
         return node
-    
+
     def get_mem_type(self, mem_type: str) -> int:
+        if self.native_trace:
+            return self.manifest.resolve(mem_type)[0]
         mem_type = mem_type.split(':')[0]  # Exclude the device number if present
         if mem_type == "LOCAL":
             return MemoryType.LOCAL_MEMORY.value
@@ -270,7 +353,7 @@ class LLMConverter:
         elif mem_type == "STORAGE":
             return MemoryType.STORAGE_MEMORY.value
         return MemoryType.INVALID_MEMORY.value
-    
+
     def get_mem_device(self, mem_type: str) -> int:
         """
         Extract the device index from mem_type.
@@ -280,6 +363,8 @@ class LLMConverter:
         - "REMOTE:1"        -> returns 1
         - "REMOTE:1.3"      -> returns 1  (device = 1, channel = 3)
         """
+        if self.native_trace:
+            return self.manifest.resolve(mem_type)[1]
         parts = mem_type.split(":", 1)
         if len(parts) == 2:
             # parts[1] may be "1" or "1.3"
@@ -331,9 +416,205 @@ class LLMConverter:
         node.attr.append(ChakraAttr(name="tensor_device", uint32_val=self.get_mem_device(mem_type)))
         node.attr.append(ChakraAttr(name="tensor_channel", uint32_val=self.get_mem_channel(mem_type)))
         return node
-        
+
     def add_parent(self, child_node: Any, parent_node: Any) -> None:
         child_node.data_deps.append(parent_node.id)
+
+    @staticmethod
+    def _string_list_attr(name: str, values: tuple[str, ...]) -> ChakraAttr:
+        return ChakraAttr(name=name, string_list=StringList(values=values))
+
+    def get_memory_movement_nodes(self, npu_id: int) -> dict[str, tuple[Any, Any]]:
+        if self.movement_events is None:
+            return {}
+        nodes = {}
+        for event in self.movement_events.events_for_npu(npu_id):
+            if event.event_id in self._emitted_movement_event_ids:
+                raise ValueError(
+                    f"movement event {event.event_id!r} was emitted more than once"
+                )
+            self._emitted_movement_event_ids.add(event.event_id)
+            node = self.get_node(f"MEMORY_MOVEMENT_{event.event_id}", MEM_LOAD_NODE)
+            node.attr.extend(
+                [
+                    ChakraAttr(name="tensor_size", uint64_val=event.bytes),
+                    ChakraAttr(name="tensor_loc", uint32_val=event.source.tier_id),
+                    ChakraAttr(name="tensor_device", uint32_val=event.source.device_id),
+                    ChakraAttr(
+                        name="memory_movement_schema_version",
+                        string_val="memory-events-v1",
+                    ),
+                    ChakraAttr(
+                        name="memory_movement_manifest_digest",
+                        string_val=self.movement_events.manifest_digest,
+                    ),
+                    ChakraAttr(
+                        name="movement_run_id",
+                        string_val=self.movement_events.run_id,
+                    ),
+                    ChakraAttr(
+                        name="movement_instance_id",
+                        string_val=self.movement_events.instance_id,
+                    ),
+                    ChakraAttr(name="movement_event_id", string_val=event.event_id),
+                    ChakraAttr(
+                        name="movement_source_iteration_id",
+                        uint32_val=event.source_iteration_id,
+                    ),
+                    ChakraAttr(name="movement_kind", string_val=event.kind),
+                    ChakraAttr(name="movement_phase", string_val=event.phase),
+                    ChakraAttr(
+                        name="movement_priority_class",
+                        string_val=event.priority_class,
+                    ),
+                    ChakraAttr(
+                        name="movement_path_id",
+                        string_val=self.movement_events.path_id,
+                    ),
+                    ChakraAttr(
+                        name="movement_engine_count",
+                        uint32_val=self.movement_events.engine_count,
+                    ),
+                    ChakraAttr(
+                        name="movement_max_priority_burst",
+                        uint32_val=self.movement_events.max_priority_burst,
+                    ),
+                    ChakraAttr(
+                        name="movement_max_in_flight_page_movements",
+                        uint32_val=(
+                            self.movement_events.max_in_flight_page_movements
+                        ),
+                    ),
+                    ChakraAttr(
+                        name="movement_destination_tier_id",
+                        uint32_val=event.destination.tier_id,
+                    ),
+                    ChakraAttr(
+                        name="movement_destination_device_id",
+                        uint32_val=event.destination.device_id,
+                    ),
+                    self._string_list_attr(
+                        "movement_resource_ids", self.movement_events.resource_ids
+                    ),
+                    self._string_list_attr(
+                        "movement_dependencies", event.depends_on
+                    ),
+                ]
+            )
+            nodes[event.event_id] = (event, node)
+        return nodes
+
+    def add_memory_movement_parents(
+        self,
+        comp_node: Any,
+        layer_name: str,
+        movement_nodes: dict[str, tuple[Any, Any]],
+    ) -> None:
+        for event, movement_node in movement_nodes.values():
+            if layer_name in event.releases:
+                self.add_parent(comp_node, movement_node)
+                self._emitted_movement_releases.add((event.event_id, layer_name))
+
+    def validate_movement_emission(self) -> None:
+        if self.movement_events is None:
+            return
+        expected_events = {
+            event.event_id for event in self.movement_events.events
+        }
+        if self._emitted_movement_event_ids != expected_events:
+            missing = sorted(expected_events - self._emitted_movement_event_ids)
+            raise ValueError(
+                f"memory movement events target NPUs with no output ET: {missing}"
+            )
+        expected_releases = {
+            (event.event_id, layer_name)
+            for event in self.movement_events.events
+            for layer_name in event.releases
+        }
+        if self._emitted_movement_releases != expected_releases:
+            missing = sorted(expected_releases - self._emitted_movement_releases)
+            raise ValueError(
+                f"memory movement releases do not name emitted compute nodes: {missing}"
+            )
+
+    def get_weight_load_nodes(self, layer: Layer) -> List[Any]:
+        if layer.weight_segments:
+            return [
+                self.get_memory_load_node(
+                    layer.name,
+                    f"WEIGHT_SEGMENT_{index}",
+                    location,
+                    size,
+                )
+                for index, (location, size) in enumerate(layer.weight_segments)
+            ]
+        if (
+            self.local_offloading or layer.weight_memory_loc != "LOCAL"
+        ) and layer.weight_memory_size > 0:
+            return [
+                self.get_memory_load_node(
+                    layer.name,
+                    "WEIGHT",
+                    layer.weight_memory_loc,
+                    layer.weight_memory_size,
+                )
+            ]
+        return []
+
+    @staticmethod
+    def _reset_layer_state(layers: List[Layer]) -> None:
+        """Discard node references written while producing a previous ET."""
+        for layer in layers:
+            layer.comp_node = None
+            layer.comm_node = None
+            if not layer.is_expert and not layer.is_pim:
+                layer.input_memory_node = None
+                layer.weight_memory_node = None
+                layer.weight_memory_nodes = []
+                layer.output_memory_node = None
+
+    @staticmethod
+    def _marker_regions(layers: List[Layer]) -> List[Any]:
+        """Return closed EXPERT/PIM regions as [start, end) Trace ranges."""
+        regions = []
+        active_kind = None
+        active_start = None
+        for index, layer in enumerate(layers):
+            if not layer.is_expert and not layer.is_pim:
+                continue
+            kind = "EXPERT" if layer.is_expert else "PIM"
+            marker = layer.expert_num if layer.is_expert else layer.pim_num
+            if marker == "END":
+                if active_kind != kind:
+                    raise ValueError(f"unmatched {kind} END marker at Trace row {index}")
+                regions.append((active_start, index + 1, kind))
+                active_kind = None
+                active_start = None
+            elif active_kind is None:
+                active_kind = kind
+                active_start = index
+            elif active_kind != kind:
+                raise ValueError(
+                    f"{kind} marker at Trace row {index} is nested inside "
+                    f"{active_kind} region starting at row {active_start}"
+                )
+        if active_kind is not None:
+            raise ValueError(
+                f"unclosed {active_kind} region starting at Trace row {active_start}"
+            )
+        return regions
+
+    def _validate_marker_boundaries(
+        self, layers: List[Layer], stage_boundaries: List[int]
+    ) -> None:
+        regions = self._marker_regions(layers)
+        for boundary in stage_boundaries:
+            for start, end, kind in regions:
+                if start <= boundary < end:
+                    raise ValueError(
+                        f"pp_stage_boundary {boundary} falls inside {kind} region "
+                        f"[{start}, {end})"
+                    )
 
     def get_stage_edges(self, num_layers: int, num_npu_group: int,
                         stage_boundaries: List[int]) -> List[Any]:
@@ -351,6 +632,8 @@ class LLMConverter:
         the V projection -- so do not reintroduce that.
         """
         if num_npu_group == 1:
+            if stage_boundaries:
+                raise ValueError("PP1 Trace must not declare pp_stage_boundaries")
             return [(0, num_layers)]
         if len(stage_boundaries) != num_npu_group - 1:
             raise ValueError(
@@ -368,6 +651,10 @@ class LLMConverter:
     def convert_common(self, f: TextIOWrapper, num_layers: int, num_npu_group: int,
                        stage_boundaries: List[int] = None):
         layers: list[Layer] = self.get_layers(f)
+        if len(layers) != num_layers:
+            raise ValueError(
+                f"Trace declares {num_layers} rows but contains {len(layers)}"
+            )
 
         # vllm: check eviction or load
         evict = None
@@ -391,7 +678,7 @@ class LLMConverter:
             else:
                 continue
             ev_ld_cnt += 1
-            
+
         layers = layers[ev_ld_cnt:]
         num_layers -= ev_ld_cnt
 
@@ -401,20 +688,27 @@ class LLMConverter:
             use_comm = False
         else:
             use_comm = True
+        self._validate_marker_boundaries(layers, stage_boundaries or [])
         stage_edges = self.get_stage_edges(num_layers, num_npu_group,
                                            stage_boundaries or [])
+        output_paths = []
 
         for npu_group in range(num_npu_group):
             for npu_offset in range(npus_per_group):
                 # Re-read the authoritative edges per rank: the walk below may
                 # rebind layer_end if it ever overruns.
                 layer_start, layer_end = stage_edges[npu_group]
+                self._reset_layer_state(layers)
                 npu_id = npu_group * npus_per_group + npu_offset + self.npu_offset
+                movement_nodes = self.get_memory_movement_nodes(npu_id)
                 output_filename = "%s.%d.et" % (self.output_filename, npu_id)
+                output_paths.append(Path(output_filename))
                 first_comp_node = True
                 with open(output_filename, "wb") as g:
                     global_metadata = self.get_global_metadata()
                     encode_message(g, global_metadata)
+                    for _, movement_node in movement_nodes.values():
+                        encode_message(g, movement_node)
                     if evict != None:
                         encode_message(g, evict)
                     if load != None:
@@ -427,7 +721,7 @@ class LLMConverter:
                             layers[layer_start].input_memory_loc,
                             layers[layer_start].input_memory_size,
                         )
-                        encode_message(g, input_load_node)                  
+                        encode_message(g, input_load_node)
                     else:
                         if layers[layer_start].is_expert or layers[layer_start].is_pim:
                             # Receive input (from the previous layer in another npu group)
@@ -461,36 +755,36 @@ class LLMConverter:
                     last_batch_type = "BATCH_1"
                     layer_num = layer_start
                     while expert_start or pim_start or attn_remain or layer_num < layer_end:
-                        if not layers[layer_num].is_expert and not layers[layer_num].is_pim: 
-                            if (self.local_offloading or layers[layer_num].weight_memory_loc != "LOCAL") and layers[layer_num].weight_memory_size > 0:
-                                # Load weight (for weight offloading)
-                                weight_load_node = self.get_memory_load_node(
-                                    layers[layer_num].name,
-                                    "WEIGHT",
-                                    layers[layer_num].weight_memory_loc,
-                                    layers[layer_num].weight_memory_size,
-                                )
-                                layers[layer_num].weight_memory_node = weight_load_node
+                        if not layers[layer_num].is_expert and not layers[layer_num].is_pim:
+                            layers[layer_num].weight_memory_nodes = (
+                                self.get_weight_load_nodes(layers[layer_num])
+                            )
+                            for weight_load_node in layers[layer_num].weight_memory_nodes:
                                 if expert_start:
-                                    self.add_parent(weight_load_node, comp_node) # dependent to previous comp_node due to gate function
+                                    self.add_parent(weight_load_node, comp_node)
                                 encode_message(g, weight_load_node)
                             # Compute
                             if layers[layer_num].comp_time != 0 and not pim_start: # pim computation is handled pim_comp_node
                                 comp_node = self.get_comp_node(
-                                    layers[layer_num].name, 
+                                    layers[layer_num].name,
                                     layers[layer_num].comp_time)
                                 layers[layer_num].comp_node = comp_node
+                                self.add_memory_movement_parents(
+                                    comp_node,
+                                    layers[layer_num].name,
+                                    movement_nodes,
+                                )
 
                                 # handle pim parent nodes, and if prefill attention remains wait until all attention is done (before o_proj)
                                 if len(pim_parent_nodes) != 0:
                                     if attn_remain:
-                                        for parent in pim_parent_nodes: 
+                                        for parent in pim_parent_nodes:
                                             self.add_parent(comp_node, parent)
                                     pim_parent_nodes = [] # reset pim parent nodes
 
                                     if "attn" in layers[layer_num].name:
                                         attn_remain = False
-                                else: 
+                                else:
                                     if first_comp_node:
                                         if npu_group == 0:
                                             self.add_parent(comp_node, input_load_node)
@@ -500,12 +794,12 @@ class LLMConverter:
                                             self.add_parent(comp_node, evict)
                                         if load != None:
                                             self.add_parent(comp_node, load)
-                                        if layers[layer_num].weight_memory_node != None:
-                                            self.add_parent(comp_node, layers[layer_num].weight_memory_node)
+                                        for weight_node in layers[layer_num].weight_memory_nodes:
+                                            self.add_parent(comp_node, weight_node)
                                         first_comp_node = False
                                     else:
-                                        if layers[layer_num].weight_memory_node != None:
-                                            self.add_parent(comp_node, layers[layer_num].weight_memory_node)
+                                        for weight_node in layers[layer_num].weight_memory_nodes:
+                                            self.add_parent(comp_node, weight_node)
                                         if layers[layer_num - 1].comm_node != None:
                                             self.add_parent(comp_node, layers[layer_num - 1].comm_node)
                                         elif layers[layer_num - 1].comp_node != None:
@@ -557,7 +851,7 @@ class LLMConverter:
                         # expert layer starts
                         elif layers[layer_num].is_expert:
                             # communication can happen even with one NPU in the group, for example, expert input gathering in data parallel
-                            if expert_start == False and layers[layer_num].comm_size > 0 and layers[layer_num].comm_type != "NONE": 
+                            if expert_start == False and layers[layer_num].comm_size > 0 and layers[layer_num].comm_type != "NONE":
                                 # Start of expert, add ALLTOALL communication before expert computation
                                 comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num].comm_size, layers[layer_num].involved_dim)
                                 layers[layer_num].comm_node = comm_coll_node
@@ -629,14 +923,11 @@ class LLMConverter:
                             else:
                                 layer_num += 1
 
-                    # The frontend cuts stages on transformer-block boundaries,
-                    # so the walk above lands exactly on the stage edge. Expert
-                    # and PIM blocks live inside a block and can no longer be
-                    # straddled; warn loudly if that ever stops holding.
                     if layer_num != layer_end:
-                        print(f"Warning! pipeline stage {npu_group} walked to "
-                              f"layer {layer_num}, expected {layer_end}")
-                        layer_end = layer_num
+                        raise ValueError(
+                            f"pipeline stage {npu_group} consumed through Trace row "
+                            f"{layer_num}, expected frozen boundary {layer_end}"
+                        )
 
                     if npu_group == (num_npu_group - 1):
                         # Store output (for the last layer)
@@ -704,10 +995,15 @@ class LLMConverter:
                         else:
                             self.add_parent(send_output_node, layers[layer_end - 2].comp_node)
                         encode_message(g, send_output_node)
-    
+        return output_paths
+
     def convert_prefill(self, f: TextIOWrapper, num_layers: int, num_npu_group: int,
                         stage_boundaries: List[int] = None):
         layers: list[Layer] = self.get_layers(f)
+        if len(layers) != num_layers:
+            raise ValueError(
+                f"Trace declares {num_layers} rows but contains {len(layers)}"
+            )
         # There will be no pim operation in prefill (PIM cannot perform GEMM)
 
         # vllm: check eviction or load
@@ -732,7 +1028,7 @@ class LLMConverter:
             else:
                 continue
             ev_ld_cnt += 1
-            
+
         layers = layers[ev_ld_cnt:]
         num_layers -= ev_ld_cnt
 
@@ -742,22 +1038,29 @@ class LLMConverter:
             use_comm = False
         else:
             use_comm = True
+        self._validate_marker_boundaries(layers, stage_boundaries or [])
         stage_edges = self.get_stage_edges(num_layers, num_npu_group,
                                            stage_boundaries or [])
+        output_paths = []
 
         for npu_group in range(num_npu_group):
             for npu_offset in range(npus_per_group):
                 # Re-read the authoritative edges per rank: the walk below may
                 # rebind layer_end if it ever overruns.
                 layer_start, layer_end = stage_edges[npu_group]
+                self._reset_layer_state(layers)
                 npu_id = npu_group * npus_per_group + npu_offset + self.npu_offset
+                movement_nodes = self.get_memory_movement_nodes(npu_id)
                 output_filename1 = "%s.%d.et" % (self.output_filename, npu_id)
                 output_filename2 = "%s.%d.et" % (self.output_filename, npu_id + self.num_npus) # sender for prefill-decode
+                output_paths.extend((Path(output_filename1), Path(output_filename2)))
                 first_comp_node = True
                 with open(output_filename1, "wb") as g, open(output_filename2, "wb") as s:
                     global_metadata = self.get_global_metadata()
                     encode_message(g, global_metadata)
                     encode_message(s, global_metadata)
+                    for _, movement_node in movement_nodes.values():
+                        encode_message(g, movement_node)
                     if evict != None:
                         encode_message(g, evict)
                     if load != None:
@@ -770,7 +1073,7 @@ class LLMConverter:
                             layers[layer_start].input_memory_loc,
                             layers[layer_start].input_memory_size,
                         )
-                        encode_message(g, input_load_node)                  
+                        encode_message(g, input_load_node)
                     else:
                         if layers[layer_start].is_expert:
                             # Receive input (from the previous layer in another npu group)
@@ -799,25 +1102,25 @@ class LLMConverter:
                     layer_num = layer_start
                     while expert_start or layer_num < layer_end:
                         if not layers[layer_num].is_expert:
-                            if (self.local_offloading or layers[layer_num].weight_memory_loc != "LOCAL") and layers[layer_num].weight_memory_size > 0:
-                                # Load weight (for weight offloading)
-                                weight_load_node = self.get_memory_load_node(
-                                    layers[layer_num].name,
-                                    "WEIGHT",
-                                    layers[layer_num].weight_memory_loc,
-                                    layers[layer_num].weight_memory_size,
-                                )
-                                layers[layer_num].weight_memory_node = weight_load_node
+                            layers[layer_num].weight_memory_nodes = (
+                                self.get_weight_load_nodes(layers[layer_num])
+                            )
+                            for weight_load_node in layers[layer_num].weight_memory_nodes:
                                 if expert_start:
-                                    self.add_parent(weight_load_node, comp_node) # dependent to previous comp_node due to gate function
+                                    self.add_parent(weight_load_node, comp_node)
                                 encode_message(g, weight_load_node)
-                            
+
                             # Compute
                             if layers[layer_num].comp_time != 0:
                                 comp_node = self.get_comp_node(
-                                    layers[layer_num].name, 
+                                    layers[layer_num].name,
                                     layers[layer_num].comp_time)
                                 layers[layer_num].comp_node = comp_node
+                                self.add_memory_movement_parents(
+                                    comp_node,
+                                    layers[layer_num].name,
+                                    movement_nodes,
+                                )
 
                                 if first_comp_node:
                                     if npu_group == 0:
@@ -828,19 +1131,19 @@ class LLMConverter:
                                         self.add_parent(comp_node, evict)
                                     if load != None:
                                         self.add_parent(comp_node, load)
-                                    if layers[layer_num].weight_memory_node != None:
-                                        self.add_parent(comp_node, layers[layer_num].weight_memory_node)
+                                    for weight_node in layers[layer_num].weight_memory_nodes:
+                                        self.add_parent(comp_node, weight_node)
                                     first_comp_node = False
                                 else:
-                                    if layers[layer_num].weight_memory_node != None:
-                                        self.add_parent(comp_node, layers[layer_num].weight_memory_node)
+                                    for weight_node in layers[layer_num].weight_memory_nodes:
+                                        self.add_parent(comp_node, weight_node)
                                     if layers[layer_num - 1].comm_node != None:
                                         self.add_parent(comp_node, layers[layer_num - 1].comm_node)
                                     elif layers[layer_num - 1].comp_node != None:
                                         self.add_parent(comp_node, layers[layer_num - 1].comp_node)
                                     else:
                                         self.add_parent(comp_node, layers[layer_num - 2].comp_node)
-                                
+
                                 encode_message(g, comp_node)
 
                                 # Send KV cache after each kv_proj.
@@ -890,7 +1193,7 @@ class LLMConverter:
                         # expert layer starts
                         elif layers[layer_num].is_expert:
                             # communication can happen even with one NPU in the group, for example, expert input gathering in data parallel
-                            if expert_start == False and layers[layer_num].comm_size > 0 and layers[layer_num].comm_type != "NONE": 
+                            if expert_start == False and layers[layer_num].comm_size > 0 and layers[layer_num].comm_type != "NONE":
                                 # Start of expert, add ALLTOALL communication before expert computation
                                 comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num].comm_size, layers[layer_num].involved_dim)
                                 layers[layer_num].comm_node = comm_coll_node
@@ -921,14 +1224,11 @@ class LLMConverter:
                                 layers[layer_num].comp_node = comp_node # is latest comp_node
                                 layer_num += 1
 
-                    # The frontend cuts stages on transformer-block boundaries,
-                    # so the walk above lands exactly on the stage edge. Expert
-                    # and PIM blocks live inside a block and can no longer be
-                    # straddled; warn loudly if that ever stops holding.
                     if layer_num != layer_end:
-                        print(f"Warning! pipeline stage {npu_group} walked to "
-                              f"layer {layer_num}, expected {layer_end}")
-                        layer_end = layer_num
+                        raise ValueError(
+                            f"pipeline stage {npu_group} consumed through Trace row "
+                            f"{layer_num}, expected frozen boundary {layer_end}"
+                        )
 
                     if npu_group == (num_npu_group - 1):
                         # Send output (for the last layer, to the paired decode npu)
@@ -984,39 +1284,66 @@ class LLMConverter:
                         else:
                             self.add_parent(send_output_node, layers[layer_end - 2].comp_node)
                         encode_message(g, send_output_node)
+        return output_paths
 
     def convert_event(self, f: TextIOWrapper, num_layers: int):
         layers: list[Layer] = self.get_layers(f)
+        if len(layers) != num_layers:
+            raise ValueError(
+                f"Trace declares {num_layers} rows but contains {len(layers)}"
+            )
+        output_paths = []
         for npu_id in range(self.num_npus):
+            movement_nodes = self.get_memory_movement_nodes(npu_id)
             output_filename = "%s.%d.et" % (self.output_filename, npu_id)
+            output_paths.append(Path(output_filename))
             with open(output_filename, "wb") as g:
                 global_metadata = self.get_global_metadata()
                 encode_message(g, global_metadata)
+                for _, movement_node in movement_nodes.values():
+                    encode_message(g, movement_node)
                 for idx, layer in enumerate(layers):
-                    comp_node = self.get_comp_node(
-                    layer.name, 
-                    layer.comp_time)
+                    comp_node = self.get_comp_node(layer.name, layer.comp_time)
                     layer.comp_node = comp_node
+                    self.add_memory_movement_parents(
+                        comp_node, layer.name, movement_nodes
+                    )
                     encode_message(g, comp_node)
+        return output_paths
 
     def convert(self):
+        self._emitted_movement_event_ids.clear()
+        self._emitted_movement_releases.clear()
         with open(self.input_filename, "r") as f:
-            first_line = f.readline().strip().split()
-            execution_type = first_line[0]
-
-            # The first line carries "key: value" pairs after the execution
-            # type, e.g. "model_parallel_NPU_group: 4  pp_stage_boundaries: 73,145,217".
-            header = {}
-            fields = first_line[1:]
-            for i in range(0, len(fields) - 1, 2):
-                if fields[i].endswith(":"):
-                    header[fields[i][:-1]] = fields[i + 1]
-
-            num_npu_group = int(header.get("model_parallel_NPU_group", 0))
-            boundary_str = header.get("pp_stage_boundaries", "")
-            stage_boundaries = (
-                [int(b) for b in boundary_str.split(",")] if boundary_str else []
-            )
+            execution_type, header = _parse_trace_header(f.readline())
+            trace_schema = header.get("trace_schema")
+            trace_digest = header.get("tier_manifest_digest")
+            native_header = trace_schema is not None or trace_digest is not None
+            if native_header:
+                if trace_schema != "llm-tier-v1":
+                    raise ValueError("native Trace requires trace_schema: llm-tier-v1")
+                if self.manifest is None:
+                    raise ValueError("native Trace requires --tier-manifest")
+                if trace_digest != self.manifest.digest:
+                    raise ValueError(
+                        "tier_manifest_digest mismatch between Trace and manifest"
+                    )
+                self.native_trace = True
+            elif self.manifest is not None:
+                raise ValueError("legacy Trace must not be used with --tier-manifest")
+            try:
+                num_npu_group = int(header.get("model_parallel_NPU_group", 0))
+            except ValueError as exc:
+                raise ValueError("invalid model_parallel_NPU_group in Trace header") from exc
+            boundary_text = header.get("pp_stage_boundaries", "")
+            try:
+                stage_boundaries = (
+                    [int(value) for value in boundary_text.split(",")]
+                    if boundary_text
+                    else []
+                )
+            except ValueError as exc:
+                raise ValueError("invalid pp_stage_boundaries in Trace header") from exc
 
             second_line = f.readline().strip()
             num_layers = int(second_line)
@@ -1026,16 +1353,25 @@ class LLMConverter:
             if execution_type == "COLOCATED":
                 if num_npu_group <= 0:
                     raise ValueError(f"model_parallel_NPU_group <= 0")
-                self.convert_common(f, num_layers, num_npu_group, stage_boundaries)
+                outputs = self.convert_common(
+                    f, num_layers, num_npu_group, stage_boundaries
+                )
             elif execution_type == "PREFILL":
                 if num_npu_group <= 0:
                     raise ValueError(f"model_parallel_NPU_group <= 0")
-                self.convert_prefill(f, num_layers, num_npu_group, stage_boundaries)
+                outputs = self.convert_prefill(
+                    f, num_layers, num_npu_group, stage_boundaries
+                )
             elif execution_type == "DECODE":
                 if num_npu_group <= 0:
                     raise ValueError(f"model_parallel_NPU_group <= 0")
-                self.convert_common(f, num_layers, num_npu_group, stage_boundaries)
+                outputs = self.convert_common(
+                    f, num_layers, num_npu_group, stage_boundaries
+                )
             elif execution_type == "EVENT":
-                self.convert_event(f, num_layers)
+                outputs = self.convert_event(f, num_layers)
             else:
                 raise ValueError(f"Unsupported execution type, {execution_type}")
+        self.validate_movement_emission()
+        validate_et_group(outputs)
+        return outputs

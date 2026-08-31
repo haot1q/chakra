@@ -37,7 +37,15 @@ def convert_pytorch(args: argparse.Namespace) -> None:
 
 def convert_llm(args: argparse.Namespace) -> None:
     """Convert llm text input trace to Chakra execution trace."""
-    converter = LLMConverter(args.input, args.output, args.num_npus, args.npu_offset, args.local_offloading)
+    converter = LLMConverter(
+        args.input,
+        args.output,
+        args.num_npus,
+        args.npu_offset,
+        args.local_offloading,
+        args.tier_manifest,
+        args.memory_events,
+    )
     converter.convert()
 
 
@@ -124,6 +132,15 @@ def main() -> None:
         ),
     )
     llm_parser.add_argument(
+        "--memory-events",
+        type=str,
+        default=None,
+        help=(
+            "Optional memory-events-v1 JSON sidecar. Requires a native Tier "
+            "Manifest and adds logical movement nodes without changing Trace rows."
+        ),
+    )
+    llm_parser.add_argument(
         "--output", type=str, required=True, help="Output Chakra execution trace filename in the protobuf format"
     )
     llm_parser.add_argument(
@@ -146,7 +163,17 @@ def main() -> None:
         help="Enable weight offloading in local (device) memory. Default is False.",
         default=False,
     )
-    
+
+    llm_parser.add_argument(
+        "--tier-manifest",
+        type=str,
+        default=None,
+        help=(
+            "Native memory-tier-runtime-v1 JSON manifest. Required for an "
+            "llm-tier-v1 Trace and rejected for a legacy Trace."
+        ),
+    )
+
     llm_parser.set_defaults(func=convert_llm)
 
     args = parser.parse_args()
