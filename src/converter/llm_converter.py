@@ -394,11 +394,26 @@ class LLMConverter:
         return 0  # Default channel number
 
 
+    def _attach_ucie_attrs(self, node: Any, mem_type: str) -> None:
+        if not self.native_trace or self.manifest is None:
+            return
+        link_id = self.manifest.ucie_link_id(mem_type)
+        if not link_id:
+            return
+        node.attr.append(
+            ChakraAttr(
+                name="ucie_transport_schema_version",
+                string_val="ucie-transport-v1",
+            )
+        )
+        node.attr.append(ChakraAttr(name="ucie_link_id", string_val=link_id))
+
     def get_memory_load_node(self, layer_name: str, tensor_type: str, mem_type: str, tensor_size: int) -> Any:
         node = self.get_node("MEM_LOAD_NODE_" + layer_name + "_" + tensor_type, MEM_LOAD_NODE)
         node.attr.append(ChakraAttr(name="tensor_size", uint64_val=tensor_size))
         node.attr.append(ChakraAttr(name="tensor_loc", uint32_val=self.get_mem_type(mem_type)))
         node.attr.append(ChakraAttr(name="tensor_device", uint32_val=self.get_mem_device(mem_type)))
+        self._attach_ucie_attrs(node, mem_type)
         return node
 
     def get_memory_store_node(self, layer_name: str, tensor_type: str, mem_type: str, tensor_size: int) -> Any:
@@ -406,6 +421,7 @@ class LLMConverter:
         node.attr.append(ChakraAttr(name="tensor_size", uint64_val=tensor_size))
         node.attr.append(ChakraAttr(name="tensor_loc", uint32_val=self.get_mem_type(mem_type)))
         node.attr.append(ChakraAttr(name="tensor_device", uint32_val=self.get_mem_device(mem_type)))
+        self._attach_ucie_attrs(node, mem_type)
         return node
 
     def get_pim_compute_node(self, layer_name: str, tensor_type: str, comp_time: int, mem_type: str, tensor_size: int) -> Any:
