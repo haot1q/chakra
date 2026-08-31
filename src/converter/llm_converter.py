@@ -531,6 +531,10 @@ class LLMConverter:
                             name="movement_expected_residency_version",
                             uint32_val=event.expected_residency_version,
                         ),
+                        ChakraAttr(
+                            name="movement_home_domain_id",
+                            uint32_val=event.home_domain_id,
+                        ),
                     ]
                 )
             nodes[event.event_id] = (event, node)

@@ -74,6 +74,7 @@ class MovementEvent:
     page_id: str | None
     transaction_id: str | None
     expected_residency_version: int | None
+    home_domain_id: int | None
     source_iteration_id: int
     npu_id: int
     kind: str
@@ -168,6 +169,7 @@ class MemoryEvents:
                     "page_id",
                     "transaction_id",
                     "expected_residency_version",
+                    "home_domain_id",
                     "source_iteration_id",
                     "npu_id",
                     "kind",
@@ -199,6 +201,7 @@ class MemoryEvents:
             page_id = raw.get("page_id")
             transaction_id = raw.get("transaction_id")
             expected_version = raw.get("expected_residency_version")
+            home_domain_id = raw.get("home_domain_id")
             if kind in {"page_promote", "page_demote"}:
                 if not isinstance(page_id, str) or not page_id:
                     raise ValueError(f"{context}.page_id must be non-empty")
@@ -207,9 +210,21 @@ class MemoryEvents:
                 expected_version = _non_negative_int(
                     expected_version, f"{context}.expected_residency_version"
                 )
+                home_domain_id = _non_negative_int(
+                    home_domain_id, f"{context}.home_domain_id"
+                )
+                if home_domain_id != source.device_id:
+                    raise ValueError(
+                        f"{context}.home_domain_id must match paired device_id"
+                    )
             elif any(
                 value is not None
-                for value in (page_id, transaction_id, expected_version)
+                for value in (
+                    page_id,
+                    transaction_id,
+                    expected_version,
+                    home_domain_id,
+                )
             ):
                 raise ValueError(
                     f"{context} non-page movement must not carry page identity"
@@ -233,6 +248,7 @@ class MemoryEvents:
                     page_id=page_id,
                     transaction_id=transaction_id,
                     expected_residency_version=expected_version,
+                    home_domain_id=home_domain_id,
                     source_iteration_id=_non_negative_int(
                         raw.get("source_iteration_id"),
                         f"{context}.source_iteration_id",
