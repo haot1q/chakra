@@ -255,6 +255,46 @@ def _native_layer(name: str, segments: str = "-") -> str:
     )
 
 
+def test_native_trace_supports_multiple_cache_writeback_prefixes(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "tiers.json"
+    digest = _write_native_manifest(manifest_path)
+    trace = tmp_path / "native.txt"
+    writebacks = [
+        "cache_writeback_a 0 hbm:0 0 hbm:0 64 hbm:0 0 NONE 0 NONE -\n",
+        "cache_writeback_b 0 hbm:0 0 hbm:0 128 hbm:0 0 NONE 0 NONE -\n",
+    ]
+    _write_trace(
+        trace,
+        [*writebacks, _native_layer("block0_layernorm")],
+        pp_size=1,
+        header_suffix=(
+            f"  trace_schema: llm-tier-v1  tier_manifest_digest: {digest}"
+        ),
+    )
+
+    outputs = LLMConverter(
+        str(trace),
+        str(tmp_path / "llm"),
+        num_npus=1,
+        tier_manifest=str(manifest_path),
+    ).convert()
+
+    _, nodes = _read_et(outputs[0])
+    stores = [
+        node for node in nodes if node.name.startswith("MEM_STORE_NODE_cache_writeback")
+    ]
+    compute = next(
+        node for node in nodes if node.name == "COMP_NODE_block0_layernorm"
+    )
+    assert sorted(
+        next(attr.uint64_val for attr in node.attr if attr.name == "tensor_size")
+        for node in stores
+    ) == [64, 128]
+    assert {node.id for node in stores} <= set(compute.data_deps)
+
+
 def _read_et(path: Path) -> tuple[GlobalMetadata, list[Node]]:
     metadata = GlobalMetadata()
     nodes = []

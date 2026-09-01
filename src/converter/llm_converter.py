@@ -642,6 +642,38 @@ class LLMConverter:
             ]
         return []
 
+    def get_prefix_memory_nodes(
+        self, layers: List[Layer]
+    ) -> tuple[List[Any], List[Any], int]:
+        """Return ordered load/store nodes encoded before model layers."""
+
+        loads = []
+        stores = []
+        prefix_count = 0
+        for layer in layers:
+            if "kv_load" in layer.name:
+                loads.append(
+                    self.get_memory_load_node(
+                        layer.name,
+                        "WEIGHT",
+                        layer.weight_memory_loc,
+                        layer.weight_memory_size,
+                    )
+                )
+            elif "kv_evict" in layer.name or "cache_writeback" in layer.name:
+                stores.append(
+                    self.get_memory_store_node(
+                        layer.name,
+                        "WEIGHT",
+                        layer.weight_memory_loc,
+                        layer.weight_memory_size,
+                    )
+                )
+            else:
+                break
+            prefix_count += 1
+        return loads, stores, prefix_count
+
     @staticmethod
     def _reset_layer_state(layers: List[Layer]) -> None:
         """Discard node references written while producing a previous ET."""
@@ -738,30 +770,9 @@ class LLMConverter:
             )
 
         # vllm: check eviction or load
-        evict = None
-        load = None
-        ev_ld_cnt = 0
-        for i in range(2):
-            if 'kv_load' in layers[i].name:
-                load = self.get_memory_load_node(
-                            layers[i].name,
-                            "WEIGHT",
-                            layers[i].weight_memory_loc,
-                            layers[i].weight_memory_size, # already per npu kv_cache size
-                        )
-            elif 'kv_evict' in layers[i].name:
-                evict = self.get_memory_store_node(
-                            layers[i].name,
-                            "WEIGHT",
-                            layers[i].weight_memory_loc,
-                            layers[i].weight_memory_size,
-                        )
-            else:
-                continue
-            ev_ld_cnt += 1
-
-        layers = layers[ev_ld_cnt:]
-        num_layers -= ev_ld_cnt
+        loads, stores, prefix_count = self.get_prefix_memory_nodes(layers)
+        layers = layers[prefix_count:]
+        num_layers -= prefix_count
 
         if self.num_npus % num_npu_group != 0: print("Warning! num_npus % num_npu_group != 0, Some npus won't do anything!")
         npus_per_group = self.num_npus // num_npu_group
@@ -790,9 +801,9 @@ class LLMConverter:
                     encode_message(g, global_metadata)
                     for _, movement_node in movement_nodes.values():
                         encode_message(g, movement_node)
-                    if evict != None:
-                        encode_message(g, evict)
-                    if load != None:
+                    for store in stores:
+                        encode_message(g, store)
+                    for load in loads:
                         encode_message(g, load)
                     if npu_group == 0:
                         # Load Input
@@ -871,9 +882,9 @@ class LLMConverter:
                                             self.add_parent(comp_node, input_load_node)
                                         else:
                                             self.add_parent(comp_node, receive_input_node)
-                                        if evict != None:
-                                            self.add_parent(comp_node, evict)
-                                        if load != None:
+                                        for store in stores:
+                                            self.add_parent(comp_node, store)
+                                        for load in loads:
                                             self.add_parent(comp_node, load)
                                         for weight_node in layers[layer_num].weight_memory_nodes:
                                             self.add_parent(comp_node, weight_node)
@@ -979,10 +990,8 @@ class LLMConverter:
                                         pim_parent_nodes.append(input_load_node)
                                     else:
                                         pim_parent_nodes.append(receive_input_node)
-                                    if evict != None:
-                                        pim_parent_nodes.append(evict)
-                                    if load != None:
-                                        pim_parent_nodes.append(load)
+                                    pim_parent_nodes.extend(stores)
+                                    pim_parent_nodes.extend(loads)
                                     # discarded weight parent because attention has no weight
                                     first_comp_node = False
                                 else:
@@ -1088,30 +1097,9 @@ class LLMConverter:
         # There will be no pim operation in prefill (PIM cannot perform GEMM)
 
         # vllm: check eviction or load
-        evict = None
-        load = None
-        ev_ld_cnt = 0
-        for i in range(2):
-            if 'kv_load' in layers[i].name:
-                load = self.get_memory_load_node(
-                            layers[i].name,
-                            "WEIGHT",
-                            layers[i].weight_memory_loc,
-                            layers[i].weight_memory_size, # already per npu kv_cache size
-                        )
-            elif 'kv_evict' in layers[i].name:
-                evict = self.get_memory_store_node(
-                            layers[i].name,
-                            "WEIGHT",
-                            layers[i].weight_memory_loc,
-                            layers[i].weight_memory_size,
-                        )
-            else:
-                continue
-            ev_ld_cnt += 1
-
-        layers = layers[ev_ld_cnt:]
-        num_layers -= ev_ld_cnt
+        loads, stores, prefix_count = self.get_prefix_memory_nodes(layers)
+        layers = layers[prefix_count:]
+        num_layers -= prefix_count
 
         if self.num_npus % num_npu_group != 0: print("Warning! num_npus % num_npu_group != 0, Some npus won't do anything!")
         npus_per_group = self.num_npus // num_npu_group
@@ -1142,9 +1130,9 @@ class LLMConverter:
                     encode_message(s, global_metadata)
                     for _, movement_node in movement_nodes.values():
                         encode_message(g, movement_node)
-                    if evict != None:
-                        encode_message(g, evict)
-                    if load != None:
+                    for store in stores:
+                        encode_message(g, store)
+                    for load in loads:
                         encode_message(g, load)
                     if npu_group == 0:
                         # Load Input
@@ -1208,9 +1196,9 @@ class LLMConverter:
                                         self.add_parent(comp_node, input_load_node)
                                     else:
                                         self.add_parent(comp_node, receive_input_node)
-                                    if evict != None:
-                                        self.add_parent(comp_node, evict)
-                                    if load != None:
+                                    for store in stores:
+                                        self.add_parent(comp_node, store)
+                                    for load in loads:
                                         self.add_parent(comp_node, load)
                                     for weight_node in layers[layer_num].weight_memory_nodes:
                                         self.add_parent(comp_node, weight_node)
