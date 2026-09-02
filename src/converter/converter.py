@@ -4,6 +4,7 @@ import logging
 from .pytorch_converter import PyTorchConverter
 from .text_converter import TextConverter
 from .llm_converter import LLMConverter
+from .pd_kv_events import convert_pd_kv_sidecar
 
 
 def setup_logging(log_filename: str) -> None:
@@ -45,8 +46,15 @@ def convert_llm(args: argparse.Namespace) -> None:
         args.local_offloading,
         args.tier_manifest,
         args.memory_events,
+        args.pd_kv_transfer_mode,
     )
     converter.convert()
+
+
+def convert_pd_kv(args: argparse.Namespace) -> None:
+    """Convert a canonical P/D descriptor into actual-endpoint P2P ETs."""
+
+    convert_pd_kv_sidecar(args.input, args.output)
 
 
 def main() -> None:
@@ -165,6 +173,13 @@ def main() -> None:
     )
 
     llm_parser.add_argument(
+        "--pd-kv-transfer-mode",
+        choices=("faithful", "legacy"),
+        default="legacy",
+        help="faithful emits only actual Prefill ranks; legacy also emits shadow Decode ranks",
+    )
+
+    llm_parser.add_argument(
         "--tier-manifest",
         type=str,
         default=None,
@@ -175,6 +190,13 @@ def main() -> None:
     )
 
     llm_parser.set_defaults(func=convert_llm)
+
+    pd_kv_parser = subparsers.add_parser(
+        "PD_KV", help="Convert pd-kv-transfer-v1 into paired P2P traces"
+    )
+    pd_kv_parser.add_argument("--input", type=str, required=True)
+    pd_kv_parser.add_argument("--output", type=str, required=True)
+    pd_kv_parser.set_defaults(func=convert_pd_kv)
 
     args = parser.parse_args()
 

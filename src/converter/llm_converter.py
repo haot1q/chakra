@@ -155,12 +155,16 @@ class LLMConverter:
         local_offloading: bool = False,
         tier_manifest: str | None = None,
         memory_events: str | None = None,
+        pd_kv_transfer_mode: str = "legacy",
     ):
         self.input_filename = input_filename
         self.output_filename = output_filename
         self.num_npus = num_npus
         self.npu_offset = npu_offset
         self.local_offloading = local_offloading
+        if pd_kv_transfer_mode not in {"faithful", "legacy"}:
+            raise ValueError("pd_kv_transfer_mode must be faithful or legacy")
+        self.pd_kv_transfer_mode = pd_kv_transfer_mode
         self.manifest = TierManifest(tier_manifest) if tier_manifest else None
         if memory_events and self.manifest is None:
             raise ValueError("--memory-events requires --tier-manifest")
@@ -265,7 +269,10 @@ class LLMConverter:
         elif execution_type == "PREFILL":
             if num_npu_group <= 0:
                 raise ValueError(f"model_parallel_NPU_group <= 0")
-            self.convert_prefill(None, num_layers, num_npu_group, stage_boundaries)
+            if self.pd_kv_transfer_mode == "faithful":
+                self.convert_common(None, num_layers, num_npu_group, stage_boundaries)
+            else:
+                self.convert_prefill(None, num_layers, num_npu_group, stage_boundaries)
         elif execution_type == "EVENT":
             self.convert_event(None, num_layers)
         else:
@@ -1428,8 +1435,14 @@ class LLMConverter:
             elif execution_type == "PREFILL":
                 if num_npu_group <= 0:
                     raise ValueError(f"model_parallel_NPU_group <= 0")
-                outputs = self.convert_prefill(
-                    f, num_layers, num_npu_group, stage_boundaries
+                outputs = (
+                    self.convert_common(
+                        f, num_layers, num_npu_group, stage_boundaries
+                    )
+                    if self.pd_kv_transfer_mode == "faithful"
+                    else self.convert_prefill(
+                        f, num_layers, num_npu_group, stage_boundaries
+                    )
                 )
             elif execution_type == "DECODE":
                 if num_npu_group <= 0:
