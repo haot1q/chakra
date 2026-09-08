@@ -12,6 +12,7 @@ from ..third_party.utils.protolib import encodeMessage as encode_message
 from .et_validator import validate_et_group
 from .memory_events import MemoryEvents
 from .tier_manifest import TierManifest
+from .service_binding import ServiceBinding
 
 
 def _parse_trace_header(line: str) -> tuple[str, dict[str, str]]:
@@ -166,6 +167,8 @@ class LLMConverter:
             raise ValueError("pd_kv_transfer_mode must be faithful or legacy")
         self.pd_kv_transfer_mode = pd_kv_transfer_mode
         self.manifest = TierManifest(tier_manifest) if tier_manifest else None
+        self.services: ServiceBinding | None = None
+        self._services_frozen = False
         if memory_events and self.manifest is None:
             raise ValueError("--memory-events requires --tier-manifest")
         self.movement_events = (
@@ -186,7 +189,17 @@ class LLMConverter:
         # parsing a file. See convert_rows.
         self._layers = None
 
-    def get_global_metadata(self):
+    def configure_physical_services(self, path: str) -> "LLMConverter":
+        """Bind once before emitting any ET; preserve the legacy constructor API."""
+        if self._services_frozen or self.services is not None:
+            raise ValueError("physical service configuration is already frozen")
+        if self.manifest is None:
+            raise ValueError("physical service bindings require a native tier manifest")
+        self.services = ServiceBinding(path, self.manifest.digest)
+        return self
+
+    def get_global_metadata(self, rank: int | None = None):
+        self._services_frozen = True
         # ``input_file`` carries the trace's *path*, not its contents.
         #
         # It used to embed the whole trace text. Nothing consumes it:
@@ -214,6 +227,8 @@ class LLMConverter:
                     string_val=self.manifest.digest,
                 )
             )
+        if self.services is not None:
+            attr.extend(self.services.metadata(rank))
         metadata = GlobalMetadata(attr=attr)
         return metadata
 
@@ -244,6 +259,8 @@ class LLMConverter:
         is len(rows) -- which is precisely what convert() reads off line two,
         since that is what the writer puts there.
         """
+        if self.services is not None or self.manifest is not None:
+            raise ValueError("native in-memory conversion is unsupported; use validated text conversion")
         self._layers = [Layer(cols=cols) for cols in rows]
 
         first_line = header_line.strip().split()
@@ -804,7 +821,7 @@ class LLMConverter:
                 output_paths.append(Path(output_filename))
                 first_comp_node = True
                 with open(output_filename, "wb") as g:
-                    global_metadata = self.get_global_metadata()
+                    global_metadata = self.get_global_metadata(npu_id)
                     encode_message(g, global_metadata)
                     for _, movement_node in movement_nodes.values():
                         encode_message(g, movement_node)
@@ -1132,9 +1149,9 @@ class LLMConverter:
                 output_paths.extend((Path(output_filename1), Path(output_filename2)))
                 first_comp_node = True
                 with open(output_filename1, "wb") as g, open(output_filename2, "wb") as s:
-                    global_metadata = self.get_global_metadata()
+                    global_metadata = self.get_global_metadata(npu_id)
                     encode_message(g, global_metadata)
-                    encode_message(s, global_metadata)
+                    encode_message(s, self.get_global_metadata(npu_id + self.num_npus))
                     for _, movement_node in movement_nodes.values():
                         encode_message(g, movement_node)
                     for store in stores:
@@ -1374,7 +1391,7 @@ class LLMConverter:
             output_filename = "%s.%d.et" % (self.output_filename, npu_id)
             output_paths.append(Path(output_filename))
             with open(output_filename, "wb") as g:
-                global_metadata = self.get_global_metadata()
+                global_metadata = self.get_global_metadata(npu_id)
                 encode_message(g, global_metadata)
                 for _, movement_node in movement_nodes.values():
                     encode_message(g, movement_node)
@@ -1407,6 +1424,10 @@ class LLMConverter:
                 self.native_trace = True
             elif self.manifest is not None:
                 raise ValueError("legacy Trace must not be used with --tier-manifest")
+            if self.services is not None:
+                self.services.validate_trace(header)
+            elif 'service_binding_digest' in header or 'service_activation_id' in header:
+                raise ValueError("Trace service identity requires --physical-service-bindings")
             try:
                 num_npu_group = int(header.get("model_parallel_NPU_group", 0))
             except ValueError as exc:

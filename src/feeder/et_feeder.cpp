@@ -93,16 +93,25 @@ void ETFeeder::readGlobalMetadata() {
       make_shared<ChakraProtoMsg::GlobalMetadata>();
   trace_.read(*pkt_msg);
   for (const auto& attr : pkt_msg->attr()) {
-    if (attr.name() != "tier_manifest_digest") {
+    if (attr.name() == "service_rank") {
+      if (service_rank_.has_value() || !attr.has_uint64_val() || attr.uint64_val() > UINT32_MAX) {
+        throw runtime_error("Duplicate or invalid service_rank metadata");
+      }
+      service_rank_ = static_cast<uint32_t>(attr.uint64_val());
       continue;
     }
-    if (!tier_manifest_digest_.empty()) {
-      throw runtime_error("Duplicate tier_manifest_digest metadata attribute");
+    std::string* destination = nullptr;
+    if (attr.name() == "tier_manifest_digest") destination = &tier_manifest_digest_;
+    if (attr.name() == "service_binding_digest") destination = &service_binding_digest_;
+    if (attr.name() == "service_activation_id") destination = &service_activation_id_;
+    if (destination == nullptr) continue;
+    if (!destination->empty()) {
+      throw runtime_error("Duplicate " + attr.name() + " metadata attribute");
     }
     if (!attr.has_string_val() || attr.string_val().empty()) {
-      throw runtime_error("tier_manifest_digest metadata must be a string");
+      throw runtime_error(attr.name() + " metadata must be a nonempty string");
     }
-    tier_manifest_digest_ = attr.string_val();
+    *destination = attr.string_val();
   }
 }
 

@@ -48,6 +48,8 @@ def convert_llm(args: argparse.Namespace) -> None:
         args.memory_events,
         args.pd_kv_transfer_mode,
     )
+    if args.physical_service_bindings:
+        converter.configure_physical_services(args.physical_service_bindings)
     converter.convert()
 
 
@@ -189,6 +191,8 @@ def main() -> None:
         ),
     )
 
+    llm_parser.add_argument("--physical-service-bindings", type=str, default=None,
+                           help="ADR-0041 native deployment binding and run activation JSON")
     llm_parser.set_defaults(func=convert_llm)
 
     pd_kv_parser = subparsers.add_parser(

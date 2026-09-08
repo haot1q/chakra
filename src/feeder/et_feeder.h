@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <queue>
 #include <string>
 #include <unordered_map>
@@ -41,12 +42,18 @@ class ETFeeder {
   void printGraph();
   const std::string& tierManifestDigest() const;
   bool hasTierManifestDigest() const;
+  const std::string& serviceBindingDigest() const { return service_binding_digest_; }
+  const std::string& serviceActivationId() const { return service_activation_id_; }
+  std::optional<uint32_t> serviceRank() const { return service_rank_; }
 
  private:
   ProtoInputStream trace_;
   const uint32_t window_size_;
   bool et_complete_;
   std::string tier_manifest_digest_;
+  std::string service_binding_digest_;
+  std::string service_activation_id_;
+  std::optional<uint32_t> service_rank_;
 
   std::map<uint64_t, std::shared_ptr<ETFeederNode>> dep_graph_{};
   std::unordered_set<uint64_t> dep_free_node_id_set_{};
