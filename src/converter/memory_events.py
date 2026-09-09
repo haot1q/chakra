@@ -102,6 +102,14 @@ class MovementEvent:
     releases: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class PriorMovement:
+    event_id: str
+    npu_id: int
+    source_iteration_id: int
+    releases: tuple[str, ...]
+
+
 class MemoryEvents:
     """Validated, immutable movement sidecar used by the LLM converter."""
 
@@ -123,6 +131,8 @@ class MemoryEvents:
                 "selected_path",
                 "events",
                 "completion_owner",
+                "prior_events",
+                "source_iteration_id",
             },
             "memory events",
         )
@@ -130,8 +140,10 @@ class MemoryEvents:
                 or payload.get("completion_owner", "workload") != completion_owner):
             raise ValueError("memory events completion owner does not match consumer")
         self.completion_owner = completion_owner
-        if payload.get("schema_version") != SCHEMA_VERSION:
-            raise ValueError(f"memory events schema_version must be {SCHEMA_VERSION}")
+        self.schema_version = payload.get("schema_version")
+        if self.schema_version not in {SCHEMA_VERSION, "memory-events-v2"}:
+            raise ValueError("unsupported memory events schema_version")
+        self.prior_events = self._read_prior_events(payload)
         for identity in ("run_id", "instance_id", "manifest_digest"):
             if not isinstance(payload.get(identity), str) or not payload[identity]:
                 raise ValueError(f"memory events {identity} must be a non-empty string")
@@ -407,9 +419,19 @@ class MemoryEvents:
 
     def _validate_dependencies(self):
         event_ids = {event.event_id for event in self._events}
+        prior = {event.event_id: event for event in self.prior_events}
+        if event_ids & prior.keys():
+            raise ValueError("prior movement must not be resubmitted")
+        used_prior = {event.event_id for event in self.prior_events if event.releases}
         graph = {event.event_id: event.depends_on for event in self._events}
         for event in self._events:
-            unknown = set(event.depends_on) - event_ids
+            if self.prior_events and event.source_iteration_id != self.source_iteration_id:
+                raise ValueError("v2 events must belong to the declared current iteration")
+            for dependency in set(event.depends_on) & prior.keys():
+                if prior[dependency].npu_id != event.npu_id:
+                    raise ValueError("prior movement dependency belongs to another rank")
+                used_prior.add(dependency)
+            unknown = set(event.depends_on) - event_ids - prior.keys()
             if unknown:
                 raise ValueError(
                     f"movement event {event.event_id!r} has dangling dependencies "
@@ -419,6 +441,8 @@ class MemoryEvents:
         visited = set()
 
         def visit(event_id):
+            if event_id in prior:
+                return
             if event_id in visiting:
                 raise ValueError("memory movement dependency graph contains a cycle")
             if event_id in visited:
@@ -431,6 +455,38 @@ class MemoryEvents:
 
         for event_id in graph:
             visit(event_id)
+        if used_prior != set(prior):
+            raise ValueError("unused prior movement declaration")
+
+    def _read_prior_events(self, payload):
+        if self.schema_version == SCHEMA_VERSION:
+            if "prior_events" in payload or "source_iteration_id" in payload:
+                raise ValueError("prior movement declarations require memory-events-v2")
+            self.source_iteration_id = None
+            return ()
+        if self.completion_owner != "workload":
+            raise ValueError("prior movement references require an ordinary workload")
+        self.source_iteration_id = _non_negative_int(payload.get("source_iteration_id"), "current iteration")
+        raw_events = payload.get("prior_events")
+        if not isinstance(raw_events, list) or not raw_events:
+            raise ValueError("memory-events-v2 requires nonempty prior events")
+        result, seen = [], set()
+        for raw in raw_events:
+            if not isinstance(raw, dict) or set(raw) != {
+                "event_id", "npu_id", "source_iteration_id", "releases"
+            }:
+                raise ValueError("prior movement fields differ from v2")
+            event_id = raw["event_id"]
+            if not isinstance(event_id, str) or not event_id or event_id in seen:
+                raise ValueError("prior movement ID is missing or duplicate")
+            rank = _non_negative_int(raw["npu_id"], "prior rank")
+            iteration = _non_negative_int(raw["source_iteration_id"], "prior iteration")
+            if iteration >= self.source_iteration_id:
+                raise ValueError("prior movement must belong to an earlier iteration")
+            result.append(PriorMovement(event_id, rank, iteration,
+                                        _unique_strings(raw["releases"], "prior releases", allow_empty=True)))
+            seen.add(event_id)
+        return tuple(result)
 
     def events_for_npu(self, npu_id: int):
         return tuple(event for event in self._events if event.npu_id == npu_id)

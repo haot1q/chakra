@@ -482,7 +482,7 @@ class LLMConverter:
                     ChakraAttr(name="tensor_device", uint32_val=event.source.device_id),
                     ChakraAttr(
                         name="memory_movement_schema_version",
-                        string_val="memory-events-v1",
+                        string_val=self.movement_events.schema_version,
                     ),
                     ChakraAttr(
                         name="memory_movement_manifest_digest",
@@ -586,6 +586,10 @@ class LLMConverter:
                     ),
                 ]
             )
+            if self.movement_events.schema_version == "memory-events-v2":
+                prior_ids = {item.event_id for item in self.movement_events.prior_events}
+                node.attr.append(self._string_list_attr(
+                    "movement_prior_dependencies", tuple(dep for dep in event.depends_on if dep in prior_ids)))
             if event.page_id is not None:
                 node.attr.extend(
                     [
@@ -607,6 +611,21 @@ class LLMConverter:
                     ]
                 )
             nodes[event.event_id] = (event, node)
+        for event in self.movement_events.prior_events:
+            if event.npu_id != npu_id or not event.releases:
+                continue
+            node = self.get_node(f"MEMORY_WAIT_{event.event_id}", MEM_LOAD_NODE)
+            node.attr.extend([
+                ChakraAttr(name="tensor_size", uint64_val=0),
+                ChakraAttr(name="memory_movement_schema_version", string_val="memory-wait-v1"),
+                ChakraAttr(name="memory_movement_manifest_digest", string_val=self.movement_events.manifest_digest),
+                ChakraAttr(name="movement_run_id", string_val=self.movement_events.run_id),
+                ChakraAttr(name="movement_instance_id", string_val=self.movement_events.instance_id),
+                ChakraAttr(name="movement_source_iteration_id", uint32_val=self.movement_events.source_iteration_id),
+                self._string_list_attr("movement_dependencies", (event.event_id,)),
+            ])
+            nodes[event.event_id] = (event, node)
+            self._emitted_movement_event_ids.add(event.event_id)
         return nodes
 
     def add_memory_movement_parents(
@@ -629,6 +648,7 @@ class LLMConverter:
         expected_events = {
             event.event_id for event in self.movement_events.events
         }
+        expected_events.update(event.event_id for event in self.movement_events.prior_events if event.releases)
         if self._emitted_movement_event_ids != expected_events:
             missing = sorted(expected_events - self._emitted_movement_event_ids)
             raise ValueError(
@@ -639,6 +659,8 @@ class LLMConverter:
             for event in self.movement_events.events
             for layer_name in event.releases
         }
+        expected_releases.update((event.event_id, layer_name)
+                                 for event in self.movement_events.prior_events for layer_name in event.releases)
         if self._emitted_movement_releases != expected_releases:
             missing = sorted(expected_releases - self._emitted_movement_releases)
             raise ValueError(
