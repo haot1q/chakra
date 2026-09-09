@@ -8,6 +8,7 @@ from pathlib import Path
 from ..third_party.utils.protolib import encodeMessage as encode_message
 from .llm_converter import LLMConverter
 from .memory_events import MemoryEvents
+from .pipeline_stage import pipeline_stage_metadata
 
 # Protocol record bound shared with MemoryPreparationTrace, not a page size.
 MAX_PREPARATION_RECORD_BYTES = 64 * 1024
@@ -20,6 +21,8 @@ class PreparationTraceInputs:
     tier_manifest: Path
     physical_services: Path
     memory_events: Path
+    pipeline_stage: dict[str, object] | None = None
+    endpoint: dict[str, object] | None = None
 
 
 def write_preparation_trace(
@@ -49,6 +52,12 @@ def write_preparation_trace(
     converter.movement_events = events
     nodes = converter.get_memory_movement_nodes(rank)
     records = [converter.get_global_metadata(rank)]
+    if (inputs.pipeline_stage is None) != (inputs.endpoint is None):
+        raise ValueError("preparation stage and endpoint must be supplied together")
+    if inputs.pipeline_stage is not None:
+        records[0].attr.append(pipeline_stage_metadata(
+            inputs.pipeline_stage, inputs.endpoint, rank, converter.services,
+        ))
     records.extend(node for _, node in nodes.values())
     if any(not 0 < record.ByteSize() <= MAX_PREPARATION_RECORD_BYTES
            for record in records):

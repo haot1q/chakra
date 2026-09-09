@@ -96,6 +96,8 @@ class ServiceBinding:
         if self.digest != "sha256:" + hashlib.sha256(canonical).hexdigest():
             raise ValueError("physical service binding content digest mismatch")
         self.ranks = frozenset(row["rank"] for row in body["ranks"])
+        self.rank_owners = {row["rank"]: (row["instance_id"], row["node_id"])
+                            for row in body["ranks"]}
         if not self.ranks or self.ranks != frozenset(range(len(self.ranks))):
             raise ValueError("physical service ranks must be complete and contiguous")
 
