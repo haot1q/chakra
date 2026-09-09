@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+from typing import Literal
 
 
 SCHEMA_VERSION = "memory-events-v1"
@@ -104,7 +105,10 @@ class MovementEvent:
 class MemoryEvents:
     """Validated, immutable movement sidecar used by the LLM converter."""
 
-    def __init__(self, filename: str, expected_manifest_digest: str):
+    def __init__(
+        self, filename: str, expected_manifest_digest: str, *,
+        completion_owner: Literal["workload", "external_preparation"] = "workload",
+    ):
         try:
             payload = json.loads(Path(filename).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
@@ -118,9 +122,14 @@ class MemoryEvents:
                 "manifest_digest",
                 "selected_path",
                 "events",
+                "completion_owner",
             },
             "memory events",
         )
+        if (completion_owner not in {"workload", "external_preparation"}
+                or payload.get("completion_owner", "workload") != completion_owner):
+            raise ValueError("memory events completion owner does not match consumer")
+        self.completion_owner = completion_owner
         if payload.get("schema_version") != SCHEMA_VERSION:
             raise ValueError(f"memory events schema_version must be {SCHEMA_VERSION}")
         for identity in ("run_id", "instance_id", "manifest_digest"):
@@ -347,9 +356,12 @@ class MemoryEvents:
             releases = _unique_strings(
                 raw.get("releases"), f"{context}.releases", allow_empty=True
             )
+            if completion_owner == "external_preparation" and releases:
+                raise ValueError("external preparation must not release compute nodes")
             if phase == "background_fill" and releases:
                 raise ValueError("background_fill must not release compute nodes")
-            if phase != "background_fill" and not releases:
+            if (completion_owner == "workload"
+                    and phase != "background_fill" and not releases):
                 raise ValueError("foreground movement must release a compute node")
             events.append(
                 MovementEvent(

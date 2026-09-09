@@ -615,6 +615,9 @@ class LLMConverter:
         layer_name: str,
         movement_nodes: dict[str, tuple[Any, Any]],
     ) -> None:
+        if (self.movement_events is not None
+                and self.movement_events.completion_owner != "workload"):
+            raise ValueError("external preparation cannot enter a workload graph")
         for event, movement_node in movement_nodes.values():
             if layer_name in event.releases:
                 self.add_parent(comp_node, movement_node)
@@ -1405,6 +1408,9 @@ class LLMConverter:
         return output_paths
 
     def convert(self):
+        if (self.movement_events is not None
+                and self.movement_events.completion_owner != "workload"):
+            raise ValueError("external preparation cannot enter a workload graph")
         self._emitted_movement_event_ids.clear()
         self._emitted_movement_releases.clear()
         with open(self.input_filename, "r") as f:
