@@ -50,6 +50,8 @@ def convert_llm(args: argparse.Namespace) -> None:
     )
     if args.physical_service_bindings:
         converter.configure_physical_services(args.physical_service_bindings)
+    if args.operator_io:
+        converter.configure_operator_io(args.operator_io)
     converter.convert()
 
 
@@ -193,6 +195,8 @@ def main() -> None:
 
     llm_parser.add_argument("--physical-service-bindings", type=str, default=None,
                            help="ADR-0041 native deployment binding and run activation JSON")
+    llm_parser.add_argument("--operator-io", type=str, default=None,
+                           help="Explicit operator-io-v1 internal memory operand sidecar")
     llm_parser.set_defaults(func=convert_llm)
 
     pd_kv_parser = subparsers.add_parser(

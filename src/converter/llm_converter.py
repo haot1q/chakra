@@ -13,6 +13,7 @@ from .et_validator import validate_et_group
 from .memory_events import MemoryEvents
 from .tier_manifest import TierManifest
 from .service_binding import ServiceBinding
+from .operator_io import OperatorIO
 
 
 def _parse_trace_header(line: str) -> tuple[str, dict[str, str]]:
@@ -168,6 +169,7 @@ class LLMConverter:
         self.pd_kv_transfer_mode = pd_kv_transfer_mode
         self.manifest = TierManifest(tier_manifest) if tier_manifest else None
         self.services: ServiceBinding | None = None
+        self.operator_io: OperatorIO | None = None
         self._services_frozen = False
         if memory_events and self.manifest is None:
             raise ValueError("--memory-events requires --tier-manifest")
@@ -196,6 +198,15 @@ class LLMConverter:
         if self.manifest is None:
             raise ValueError("physical service bindings require a native tier manifest")
         self.services = ServiceBinding(path, self.manifest.digest)
+        return self
+
+    def configure_operator_io(self, path: str) -> "LLMConverter":
+        """Bind explicit internal operand traffic once before creating any ET."""
+        if self._services_frozen or self.operator_io is not None:
+            raise ValueError("operator IO configuration is already frozen")
+        if self.manifest is None:
+            raise ValueError("operator IO requires a native tier manifest")
+        self.operator_io = OperatorIO(path, self.manifest)
         return self
 
     def get_global_metadata(self, rank: int | None = None):
@@ -823,6 +834,10 @@ class LLMConverter:
         layers = layers[prefix_count:]
         num_layers -= prefix_count
 
+        if self.operator_io is not None and (
+                self.num_npus <= 0 or num_npu_group <= 0
+                or self.num_npus % num_npu_group != 0):
+            raise ValueError("operator IO: ranks must exactly cover positive TP/PP groups")
         if self.num_npus % num_npu_group != 0: print("Warning! num_npus % num_npu_group != 0, Some npus won't do anything!")
         npus_per_group = self.num_npus // num_npu_group
         if npus_per_group == 1: # same as pipeline parallelism, ignore all reduce
@@ -832,6 +847,11 @@ class LLMConverter:
         self._validate_marker_boundaries(layers, stage_boundaries or [])
         stage_edges = self.get_stage_edges(num_layers, num_npu_group,
                                            stage_boundaries or [])
+        if self.operator_io is not None:
+            self.operator_io.validate_rows(
+                layers, stage_edges, prefix_count=prefix_count,
+                tp=npus_per_group, rank_offset=self.npu_offset,
+            )
         output_paths = []
 
         for npu_group in range(num_npu_group):
@@ -845,6 +865,7 @@ class LLMConverter:
                 output_filename = "%s.%d.et" % (self.output_filename, npu_id)
                 output_paths.append(Path(output_filename))
                 first_comp_node = True
+                operator_io_tail = ()
                 with open(output_filename, "wb") as g:
                     global_metadata = self.get_global_metadata(npu_id)
                     encode_message(g, global_metadata)
@@ -905,7 +926,10 @@ class LLMConverter:
                                     self.add_parent(weight_load_node, comp_node)
                                 encode_message(g, weight_load_node)
                             # Compute
-                            if layers[layer_num].comp_time != 0 and not pim_start: # pim computation is handled pim_comp_node
+                            # Zero-duration boundaries still carry source dependencies
+                            # in explicit mode, including collective-only operations.
+                            explicit_io = self.operator_io is not None
+                            if (layers[layer_num].comp_time != 0 or explicit_io) and not pim_start: # pim computation is handled pim_comp_node
                                 comp_node = self.get_comp_node(
                                     layers[layer_num].name,
                                     layers[layer_num].comp_time)
@@ -962,7 +986,19 @@ class LLMConverter:
                                         pim_comp_nodes = [] # reset pim comp nodes
                                         last_batch_type = layers[layer_num].misc
 
+                                for parent in operator_io_tail:
+                                    self.add_parent(comp_node, parent)
+                                operator_io_tail = ()
+                                if self.operator_io is not None:
+                                    for read in self.operator_io.before_compute(
+                                            self, comp_node, npu_id, layer_num + prefix_count):
+                                        encode_message(g, read)
                                 encode_message(g, comp_node)
+                                if self.operator_io is not None:
+                                    operator_io_tail = self.operator_io.after_compute(
+                                        self, comp_node, npu_id, layer_num + prefix_count)
+                                    for write in operator_io_tail:
+                                        encode_message(g, write)
 
                             # PIM compute
                             if pim_start:
@@ -984,8 +1020,10 @@ class LLMConverter:
                                 # for j in range(self.num_dims):
                                 # comm_coll_node.involved_dim.append(True)
                                 layers[layer_num].comm_node = comm_coll_node
-                                if layers[layer_num].comp_time != 0:
+                                if layers[layer_num].comp_time != 0 or self.operator_io is not None:
                                     self.add_parent(comm_coll_node, comp_node)
+                                for parent in operator_io_tail:
+                                    self.add_parent(comm_coll_node, parent)
                                 encode_message(g, comm_coll_node)
                             # add layer_num
                             layer_num += 1
@@ -997,6 +1035,8 @@ class LLMConverter:
                                 comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num].comm_size, layers[layer_num].involved_dim)
                                 layers[layer_num].comm_node = comm_coll_node
                                 self.add_parent(comm_coll_node, comp_node)
+                                for parent in operator_io_tail:
+                                    self.add_parent(comm_coll_node, parent)
                                 encode_message(g, comm_coll_node)
                             expert_start = True
                             # check expert end
@@ -1008,6 +1048,8 @@ class LLMConverter:
                                     comm_coll_node = self.get_comm_coll_node("expert_end", layers[layer_num].comm_type, layers[layer_num].comm_size, layers[layer_num].involved_dim)
                                     layers[layer_num].comm_node = comm_coll_node
                                     self.add_parent(comm_coll_node, comp_node)
+                                    for parent in operator_io_tail:
+                                        self.add_parent(comm_coll_node, parent)
                                     encode_message(g, comm_coll_node)
                                 layer_num += 1
                                 continue
@@ -1101,6 +1143,8 @@ class LLMConverter:
                             self.add_parent(output_store_node, comp_node)
                         else:
                             self.add_parent(output_store_node, layers[layer_end - 2].comp_node)
+                        for parent in operator_io_tail:
+                            self.add_parent(output_store_node, parent)
                         encode_message(g, output_store_node)
                     else:
                         if layers[layer_end - 1].is_expert or layers[layer_end - 1].is_pim:
@@ -1133,6 +1177,8 @@ class LLMConverter:
                             self.add_parent(send_output_node, comp_node)
                         else:
                             self.add_parent(send_output_node, layers[layer_end - 2].comp_node)
+                        for parent in operator_io_tail:
+                            self.add_parent(send_output_node, parent)
                         encode_message(g, send_output_node)
         return output_paths
 
@@ -1456,6 +1502,12 @@ class LLMConverter:
                 self.services.validate_trace(header)
             elif 'service_binding_digest' in header or 'service_activation_id' in header:
                 raise ValueError("Trace service identity requires --physical-service-bindings")
+            if self.operator_io is not None:
+                self.operator_io.validate_trace(self.input_filename, header, execution_type)
+                if execution_type == "PREFILL" and self.pd_kv_transfer_mode != "faithful":
+                    raise ValueError("operator IO requires the common pipeline converter")
+            elif "operator_io" in header:
+                raise ValueError("Trace operator IO requires an explicit sidecar")
             try:
                 num_npu_group = int(header.get("model_parallel_NPU_group", 0))
             except ValueError as exc:
@@ -1504,5 +1556,7 @@ class LLMConverter:
             else:
                 raise ValueError(f"Unsupported execution type, {execution_type}")
         self.validate_movement_emission()
+        if self.operator_io is not None:
+            self.operator_io.validate_emission()
         validate_et_group(outputs)
         return outputs
