@@ -12,6 +12,11 @@ from typing import TYPE_CHECKING
 from ...schema.protobuf.et_def_pb2 import Node
 from .tier_manifest import TierManifest
 
+# Complete multi-rank Native sidecars exceed the old 4 MiB component budget.
+# Keep a finite bound; row/segment limits and strict field validation remain.
+MAX_OPERATOR_IO_BYTES = 64 * 1024 * 1024
+MAX_OPERATOR_IO_ROWS = 200000
+
 if TYPE_CHECKING:
     from .llm_converter import LLMConverter, Layer
 
@@ -75,8 +80,8 @@ class OperatorIO:
         if source.is_symlink() or not source.is_file():
             raise ValueError("operator IO: expected regular sidecar file")
         with source.open("rb") as stream:
-            encoded = stream.read(4 * 1024 * 1024 + 1)
-        if len(encoded) > 4 * 1024 * 1024:
+            encoded = stream.read(MAX_OPERATOR_IO_BYTES + 1)
+        if len(encoded) > MAX_OPERATOR_IO_BYTES:
             raise ValueError("operator IO: sidecar exceeds byte limit")
         body = _fields(json.loads(encoded, object_pairs_hook=_object), {
             "schema_version", "accounting", "tier_manifest_digest", "trace_sha256", "rows",
@@ -90,7 +95,7 @@ class OperatorIO:
             raise ValueError("operator IO: malformed Trace digest")
         self.trace_digest = digest
         rows = body["rows"]
-        if not isinstance(rows, list) or not rows or len(rows) > 100000:
+        if not isinstance(rows, list) or not rows or len(rows) > MAX_OPERATOR_IO_ROWS:
             raise ValueError("operator IO: expected nonempty bounded rows")
         self.rows: dict[tuple[int, int], OperandIO] = {}
         self._emitted: set[tuple[int, int]] = set()
