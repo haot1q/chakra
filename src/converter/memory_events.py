@@ -490,9 +490,17 @@ class MemoryEvents:
             raise ValueError("unused prior movement declaration")
 
     def _read_prior_events(self, payload):
-        if self.schema_version != "memory-events-v2":
-            if "prior_events" in payload or "source_iteration_id" in payload:
-                raise ValueError("prior movement declarations require memory-events-v2")
+        declares_prior = (
+            "prior_events" in payload or "source_iteration_id" in payload
+        )
+        if self.schema_version not in {"memory-events-v2", "memory-events-v3"}:
+            if declares_prior:
+                raise ValueError(
+                    "prior movement declarations require memory-events-v2 or v3"
+                )
+            self.source_iteration_id = None
+            return ()
+        if self.schema_version == "memory-events-v3" and not declares_prior:
             self.source_iteration_id = None
             return ()
         if self.completion_owner != "workload":
@@ -500,7 +508,9 @@ class MemoryEvents:
         self.source_iteration_id = _non_negative_int(payload.get("source_iteration_id"), "current iteration")
         raw_events = payload.get("prior_events")
         if not isinstance(raw_events, list) or not raw_events:
-            raise ValueError("memory-events-v2 requires nonempty prior events")
+            raise ValueError(
+                "memory-events-v2/v3 requires nonempty prior events"
+            )
         result, seen = [], set()
         for raw in raw_events:
             if not isinstance(raw, dict) or set(raw) != {

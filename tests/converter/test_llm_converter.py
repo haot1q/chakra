@@ -8,6 +8,7 @@ import pytest
 from chakra.schema.protobuf.et_def_pb2 import GlobalMetadata, Node
 from chakra.src.converter.et_validator import ETValidationError, validate_et_group
 from chakra.src.converter.llm_converter import LLMConverter
+from chakra.src.converter.memory_events import MemoryEvents
 from chakra.src.converter.tier_manifest import canonical_manifest_digest
 from chakra.src.third_party.utils.protolib import decodeMessage, encodeMessage
 
@@ -538,6 +539,37 @@ def test_memory_events_v3_orders_compute_then_movement_then_compute(
         _string_attr(movement, "memory_movement_schema_version")
         == "memory-events-v1"
     )
+
+
+def test_memory_events_v3_accepts_prior_iteration_dependencies(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "tiers.json"
+    digest = _write_native_manifest(manifest_path)
+    events_path = tmp_path / "memory-events.json"
+    _write_movement_events(events_path, digest)
+    payload = json.loads(events_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = "memory-events-v3"
+    payload["source_iteration_id"] = 1
+    payload["prior_events"] = [{
+        "event_id": "prior-0",
+        "npu_id": 0,
+        "source_iteration_id": 0,
+        "releases": [],
+    }]
+    for event in payload["events"]:
+        event["source_iteration_id"] = 1
+    payload["events"][0]["depends_on"] = ["prior-0"]
+    payload["events"][0]["releases"] = ["unrelated"]
+    payload["events"][0]["waits_for"] = ["block0_layernorm"]
+    events_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    events = MemoryEvents(str(events_path), digest)
+
+    assert events.schema_version == "memory-events-v3"
+    assert events.source_iteration_id == 1
+    assert events.prior_events[0].event_id == "prior-0"
+    assert events.events[0].waits_for == ("block0_layernorm",)
 
 
 def test_implemented_path_contract_is_carried_to_et(tmp_path: Path) -> None:
