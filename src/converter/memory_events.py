@@ -167,8 +167,8 @@ class MemoryEvents:
             "selected_path",
         )
         self.path_id = selected.get("id")
-        if self.path_id not in _PATH_RESOURCES:
-            raise ValueError("selected_path.id must be base_die_local or gpu_routed")
+        if self.path_id not in {*_PATH_RESOURCES, "host_pcie"}:
+            raise ValueError("unsupported selected_path.id")
         self.engine_count = _positive_int(
             selected.get("engine_count"), "selected_path.engine_count"
         )
@@ -242,7 +242,7 @@ class MemoryEvents:
                     ("bandwidth_resource", "read"),
                     ("bandwidth_resource", "write"),
                 )
-                if self.path_id == "base_die_local"
+                if self.path_id in {"base_die_local", "host_pcie"}
                 else (
                     ("ucie_transaction", "read"),
                     ("bandwidth_resource", "write"),
@@ -255,7 +255,7 @@ class MemoryEvents:
                 )
             self.path_segments = tuple(segments)
             expected_resources = (
-                "lpddr_read",
+                "host_read" if self.path_id == "host_pcie" else "lpddr_read",
                 *(segment.bill_id for segment in self.path_segments),
                 "hbm_write",
             )
@@ -264,6 +264,8 @@ class MemoryEvents:
                     "selected_path.resource_ids must match ordered segments"
                 )
         elif self.path_contract_status == "compatibility_checkpoint":
+            if self.path_id == "host_pcie":
+                raise ValueError("Host path requires implemented contract")
             if any(
                 selected.get(field) is not None
                 for field in ("schema_version", "timing_provenance", "segments")
@@ -323,7 +325,7 @@ class MemoryEvents:
             destination = self._endpoint(
                 raw.get("destination"), f"{context}.destination"
             )
-            if source.device_id != destination.device_id:
+            if self.path_id != "host_pcie" and source.device_id != destination.device_id:
                 raise ValueError(f"{context} violates paired HBM destination")
             kind = raw.get("kind")
             if kind not in {"load", "store", "page_promote", "page_demote"}:
@@ -343,10 +345,19 @@ class MemoryEvents:
                 home_domain_id = _non_negative_int(
                     home_domain_id, f"{context}.home_domain_id"
                 )
-                if home_domain_id != source.device_id:
+                hot = destination if kind == "page_promote" else source
+                cold = source if kind == "page_promote" else destination
+                if self.path_id == "host_pcie" and (
+                    cold.device_id != 0 or hot.device_id != home_domain_id
+                    or cold.tier_id == hot.tier_id
+                ):
+                    raise ValueError(f"{context} has invalid shared Host endpoints")
+                if self.path_id != "host_pcie" and home_domain_id != source.device_id:
                     raise ValueError(
                         f"{context}.home_domain_id must match paired device_id"
                     )
+            elif self.path_id == "host_pcie":
+                raise ValueError("Host path only supports Page movements")
             elif any(
                 value is not None
                 for value in (
