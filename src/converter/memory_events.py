@@ -100,6 +100,7 @@ class MovementEvent:
     priority_class: str
     depends_on: tuple[str, ...]
     releases: tuple[str, ...]
+    waits_for: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -141,7 +142,11 @@ class MemoryEvents:
             raise ValueError("memory events completion owner does not match consumer")
         self.completion_owner = completion_owner
         self.schema_version = payload.get("schema_version")
-        if self.schema_version not in {SCHEMA_VERSION, "memory-events-v2"}:
+        if self.schema_version not in {
+            SCHEMA_VERSION,
+            "memory-events-v2",
+            "memory-events-v3",
+        }:
             raise ValueError("unsupported memory events schema_version")
         self.prior_events = self._read_prior_events(payload)
         for identity in ("run_id", "instance_id", "manifest_digest"):
@@ -312,6 +317,7 @@ class MemoryEvents:
                     "priority_class",
                     "depends_on",
                     "releases",
+                    "waits_for",
                 },
                 context,
             )
@@ -379,6 +385,19 @@ class MemoryEvents:
             releases = _unique_strings(
                 raw.get("releases"), f"{context}.releases", allow_empty=True
             )
+            waits_for = _unique_strings(
+                raw.get("waits_for", []),
+                f"{context}.waits_for",
+                allow_empty=True,
+            )
+            if waits_for and self.schema_version != "memory-events-v3":
+                raise ValueError(
+                    "movement compute predecessors require memory-events-v3"
+                )
+            if set(releases) & set(waits_for):
+                raise ValueError(
+                    f"{context} must not release and wait for the same compute node"
+                )
             if completion_owner == "external_preparation" and releases:
                 raise ValueError("external preparation must not release compute nodes")
             if phase == "background_fill" and releases:
@@ -410,6 +429,7 @@ class MemoryEvents:
                         allow_empty=True,
                     ),
                     releases=releases,
+                    waits_for=waits_for,
                 )
             )
         self._events = tuple(events)
@@ -470,7 +490,7 @@ class MemoryEvents:
             raise ValueError("unused prior movement declaration")
 
     def _read_prior_events(self, payload):
-        if self.schema_version == SCHEMA_VERSION:
+        if self.schema_version != "memory-events-v2":
             if "prior_events" in payload or "source_iteration_id" in payload:
                 raise ValueError("prior movement declarations require memory-events-v2")
             self.source_iteration_id = None

@@ -180,6 +180,7 @@ class LLMConverter:
         )
         self._emitted_movement_event_ids: set[str] = set()
         self._emitted_movement_releases: set[tuple[str, str]] = set()
+        self._emitted_movement_waits: set[tuple[str, str]] = set()
         self.native_trace = False
         self.next_node_id = 0
 
@@ -493,7 +494,12 @@ class LLMConverter:
                     ChakraAttr(name="tensor_device", uint32_val=event.source.device_id),
                     ChakraAttr(
                         name="memory_movement_schema_version",
-                        string_val=self.movement_events.schema_version,
+                        string_val=(
+                            "memory-events-v1"
+                            if self.movement_events.schema_version
+                            == "memory-events-v3"
+                            else self.movement_events.schema_version
+                        ),
                     ),
                     ChakraAttr(
                         name="memory_movement_manifest_digest",
@@ -637,6 +643,10 @@ class LLMConverter:
             ])
             nodes[event.event_id] = (event, node)
             self._emitted_movement_event_ids.add(event.event_id)
+        for event, node in nodes.values():
+            for dependency in getattr(event, "depends_on", ()):
+                if dependency in nodes:
+                    self.add_parent(node, nodes[dependency][1])
         return nodes
 
     def add_memory_movement_parents(
@@ -652,6 +662,9 @@ class LLMConverter:
             if layer_name in event.releases:
                 self.add_parent(comp_node, movement_node)
                 self._emitted_movement_releases.add((event.event_id, layer_name))
+            if layer_name in getattr(event, "waits_for", ()):
+                self.add_parent(movement_node, comp_node)
+                self._emitted_movement_waits.add((event.event_id, layer_name))
 
     def validate_movement_emission(self) -> None:
         if self.movement_events is None:
@@ -676,6 +689,17 @@ class LLMConverter:
             missing = sorted(expected_releases - self._emitted_movement_releases)
             raise ValueError(
                 f"memory movement releases do not name emitted compute nodes: {missing}"
+            )
+        expected_waits = {
+            (event.event_id, layer_name)
+            for event in self.movement_events.events
+            for layer_name in event.waits_for
+        }
+        if self._emitted_movement_waits != expected_waits:
+            missing = sorted(expected_waits - self._emitted_movement_waits)
+            raise ValueError(
+                "memory movement predecessors do not name emitted compute "
+                f"nodes: {missing}"
             )
 
     def get_weight_load_nodes(self, layer: Layer) -> List[Any]:
@@ -869,8 +893,6 @@ class LLMConverter:
                 with open(output_filename, "wb") as g:
                     global_metadata = self.get_global_metadata(npu_id)
                     encode_message(g, global_metadata)
-                    for _, movement_node in movement_nodes.values():
-                        encode_message(g, movement_node)
                     for store in stores:
                         encode_message(g, store)
                     for load in loads:
@@ -1180,6 +1202,8 @@ class LLMConverter:
                         for parent in operator_io_tail:
                             self.add_parent(send_output_node, parent)
                         encode_message(g, send_output_node)
+                    for _, movement_node in movement_nodes.values():
+                        encode_message(g, movement_node)
         return output_paths
 
     def convert_prefill(self, f: TextIOWrapper, num_layers: int, num_npu_group: int,
@@ -1223,8 +1247,6 @@ class LLMConverter:
                     global_metadata = self.get_global_metadata(npu_id)
                     encode_message(g, global_metadata)
                     encode_message(s, self.get_global_metadata(npu_id + self.num_npus))
-                    for _, movement_node in movement_nodes.values():
-                        encode_message(g, movement_node)
                     for store in stores:
                         encode_message(g, store)
                     for load in loads:
@@ -1448,6 +1470,8 @@ class LLMConverter:
                         else:
                             self.add_parent(send_output_node, layers[layer_end - 2].comp_node)
                         encode_message(g, send_output_node)
+                    for _, movement_node in movement_nodes.values():
+                        encode_message(g, movement_node)
         return output_paths
 
     def convert_event(self, f: TextIOWrapper, num_layers: int):
@@ -1464,8 +1488,6 @@ class LLMConverter:
             with open(output_filename, "wb") as g:
                 global_metadata = self.get_global_metadata(npu_id)
                 encode_message(g, global_metadata)
-                for _, movement_node in movement_nodes.values():
-                    encode_message(g, movement_node)
                 for idx, layer in enumerate(layers):
                     comp_node = self.get_comp_node(layer.name, layer.comp_time)
                     layer.comp_node = comp_node
@@ -1473,6 +1495,8 @@ class LLMConverter:
                         comp_node, layer.name, movement_nodes
                     )
                     encode_message(g, comp_node)
+                for _, movement_node in movement_nodes.values():
+                    encode_message(g, movement_node)
         return output_paths
 
     def convert(self):
@@ -1481,6 +1505,7 @@ class LLMConverter:
             raise ValueError("external preparation cannot enter a workload graph")
         self._emitted_movement_event_ids.clear()
         self._emitted_movement_releases.clear()
+        self._emitted_movement_waits.clear()
         with open(self.input_filename, "r") as f:
             execution_type, header = _parse_trace_header(f.readline())
             trace_schema = header.get("trace_schema")

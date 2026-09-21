@@ -495,6 +495,51 @@ def test_memory_events_add_logical_nodes_and_only_true_consumer_waits(
     assert _uint_attr(critical, "movement_home_domain_id") == 0
 
 
+def test_memory_events_v3_orders_compute_then_movement_then_compute(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "tiers.json"
+    digest = _write_native_manifest(manifest_path)
+    events_path = tmp_path / "memory-events.json"
+    _write_movement_events(events_path, digest)
+    payload = json.loads(events_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = "memory-events-v3"
+    payload["events"][0]["releases"] = ["unrelated"]
+    payload["events"][0]["waits_for"] = ["block0_layernorm"]
+    events_path.write_text(json.dumps(payload), encoding="utf-8")
+    trace = tmp_path / "native.txt"
+    _write_trace(
+        trace,
+        [_native_layer("block0_layernorm"), _native_layer("unrelated")],
+        pp_size=1,
+        header_suffix=(
+            f"  trace_schema: llm-tier-v1  tier_manifest_digest: {digest}"
+        ),
+    )
+
+    outputs = LLMConverter(
+        str(trace),
+        str(tmp_path / "llm"),
+        num_npus=1,
+        tier_manifest=str(manifest_path),
+        memory_events=str(events_path),
+    ).convert()
+
+    _, nodes = _read_et(outputs[0])
+    by_name = {node.name: node for node in nodes}
+    first = by_name["COMP_NODE_block0_layernorm"]
+    movement = by_name["MEMORY_MOVEMENT_critical-0"]
+    background = by_name["MEMORY_MOVEMENT_background-0"]
+    resumed = by_name["COMP_NODE_unrelated"]
+    assert first.id in movement.data_deps
+    assert movement.id in background.data_deps
+    assert movement.id in resumed.data_deps
+    assert (
+        _string_attr(movement, "memory_movement_schema_version")
+        == "memory-events-v1"
+    )
+
+
 def test_implemented_path_contract_is_carried_to_et(tmp_path: Path) -> None:
     manifest_path = tmp_path / "tiers.json"
     digest = _write_native_manifest(manifest_path)
