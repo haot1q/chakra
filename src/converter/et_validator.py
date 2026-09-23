@@ -12,6 +12,7 @@ from google.protobuf.message import DecodeError
 from ...schema.protobuf.et_def_pb2 import (
     COMM_RECV_NODE,
     COMM_SEND_NODE,
+    INVALID_NODE,
     GlobalMetadata,
     Node,
 )
@@ -89,6 +90,7 @@ def _validate_local_graph(path: Path, nodes: Sequence[Node]) -> None:
     children: dict[int, set[int]] = defaultdict(set)
     indegree = {node_id: 0 for node_id in node_ids}
     for node in nodes:
+        _validate_dependency_delay(path, node)
         for parent_id in (*node.data_deps, *node.ctrl_deps):
             if parent_id not in node_ids:
                 raise ETValidationError(
@@ -109,6 +111,23 @@ def _validate_local_graph(path: Path, nodes: Sequence[Node]) -> None:
                 ready.append(child_id)
     if visited != len(nodes):
         raise ETValidationError(f"{path}: dependency cycle detected")
+
+
+def _validate_dependency_delay(path: Path, node: Node) -> None:
+    """Reject malformed resource-neutral gates before backend submission."""
+    attrs = {attr.name: attr for attr in node.attr}
+    names = {"dependency_delay_schema", "dependency_delay_ns"}
+    if not names.intersection(attrs):
+        return
+    if (set(attrs) != names or len(node.attr) != 2
+            or node.type != INVALID_NODE or node.duration_micros != 0
+            or node.ctrl_deps):
+        raise ETValidationError(f"{path}: invalid dependency-delay attributes or payload")
+    schema, duration = attrs["dependency_delay_schema"], attrs["dependency_delay_ns"]
+    if (schema.WhichOneof("value") != "string_val"
+            or schema.string_val != "dependency-delay-v1"
+            or duration.WhichOneof("value") != "uint64_val"):
+        raise ETValidationError(f"{path}: invalid dependency-delay-v1 version or duration")
 
 
 def _p2p_key(path: Path, node: Node) -> tuple[object, ...]:
