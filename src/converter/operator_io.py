@@ -14,8 +14,8 @@ from .tier_manifest import TierManifest
 
 # Complete multi-rank Native sidecars exceed the old 4 MiB component budget.
 # Keep a finite bound; row/segment limits and strict field validation remain.
-MAX_OPERATOR_IO_BYTES = 64 * 1024 * 1024
-MAX_OPERATOR_IO_ROWS = 200000
+MAX_OPERATOR_IO_BYTES = 256 * 1024 * 1024
+MAX_OPERATOR_IO_ROWS = 1_000_000
 
 if TYPE_CHECKING:
     from .llm_converter import LLMConverter, Layer
@@ -86,7 +86,7 @@ class OperatorIO:
         body = _fields(json.loads(encoded, object_pairs_hook=_object), {
             "schema_version", "accounting", "tier_manifest_digest", "trace_sha256", "rows",
         })
-        if (body["schema_version"] != "operator-io-v1"
+        if (body["schema_version"] not in ("operator-io-v1", "operator-io-v2")
                 or body["accounting"] != "ucie_transport_v1"
                 or body["tier_manifest_digest"] != manifest.digest):
             raise ValueError("operator IO: schema/accounting/manifest mismatch")
@@ -94,21 +94,29 @@ class OperatorIO:
         if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
             raise ValueError("operator IO: malformed Trace digest")
         self.trace_digest = digest
+        self.schema_version = body["schema_version"]
+        self._trace_validated = False
         rows = body["rows"]
         if not isinstance(rows, list) or not rows or len(rows) > MAX_OPERATOR_IO_ROWS:
             raise ValueError("operator IO: expected nonempty bounded rows")
         self.rows: dict[tuple[int, int], OperandIO] = {}
         self._emitted: set[tuple[int, int]] = set()
+        fields = {"rank", "row", "reads", "writes"}
+        if self.schema_version == "operator-io-v1":
+            fields.add("name")
         for raw in rows:
-            row = _fields(raw, {"rank", "row", "name", "reads", "writes"})
+            row = _fields(raw, fields)
             key = (_uint(row["rank"]), _uint(row["row"]))
-            if key in self.rows or not isinstance(row["name"], str) or not row["name"]:
+            name = row["name"] if self.schema_version == "operator-io-v1" else ""
+            if key in self.rows or not isinstance(name, str) or (
+                    self.schema_version == "operator-io-v1" and not name):
                 raise ValueError("operator IO: duplicate coordinate or empty row name")
-            self.rows[key] = OperandIO(row["name"], _segments(row["reads"], manifest),
+            self.rows[key] = OperandIO(name, _segments(row["reads"], manifest),
                                        _segments(row["writes"], manifest))
 
     def validate_trace(self, path: str, header: dict[str, str], execution: str) -> None:
         self._emitted.clear()
+        self._trace_validated = False
         if (header.get("operator_io") != "ucie_transport_v1"
                 or execution not in {"COLOCATED", "DECODE", "PREFILL"}):
             raise ValueError("operator IO: incompatible Trace header or execution mode")
@@ -118,12 +126,15 @@ class OperatorIO:
                 digest.update(chunk)
         if digest.hexdigest() != self.trace_digest:
             raise ValueError("operator IO: Trace content digest mismatch")
+        self._trace_validated = True
 
     def validate_rows(
         self, layers: list[Layer], stages: list[tuple[int, int]], *,
         prefix_count: int, tp: int, rank_offset: int,
     ) -> None:
         """Reject wrong ownership or double charging before any ET is created."""
+        if not self._trace_validated:
+            raise ValueError("operator IO: validate Trace identity before resolving rows")
         if any(layer.is_pim or (not layer.is_expert and layer.misc != "NONE") for layer in layers):
             raise ValueError("operator IO: PIM/interleaving is not supported")
         declared: dict[int, tuple[set[int], set[int]]] = {}
@@ -141,6 +152,9 @@ class OperatorIO:
             if index in expert_rows:
                 raise ValueError("operator IO: expert-owned rows are not supported")
             layer = layers[index]
+            if self.schema_version == "operator-io-v2":
+                io = OperandIO(layer.name, io.reads, io.writes)
+                self.rows[rank, row] = io
             if (layer.is_expert or io.name != layer.name or layer.comm_type != "NONE"
                     or layer.weight_memory_size or layer.weight_segments):
                 raise ValueError("operator IO: row identity or legacy IO/collective overlap")
