@@ -334,7 +334,8 @@ class MemoryEvents:
             if self.path_id != "host_pcie" and source.device_id != destination.device_id:
                 raise ValueError(f"{context} violates paired HBM destination")
             kind = raw.get("kind")
-            if kind not in {"load", "store", "page_promote", "page_demote"}:
+            if kind not in {"load", "store", "page_promote", "page_demote",
+                            "kv_cold_copy_store", "kv_cold_copy_load"}:
                 raise ValueError(f"{context}.kind is unsupported")
             page_id = raw.get("page_id")
             transaction_id = raw.get("transaction_id")
@@ -362,8 +363,19 @@ class MemoryEvents:
                     raise ValueError(
                         f"{context}.home_domain_id must match paired device_id"
                     )
+            elif kind in {"kv_cold_copy_store", "kv_cold_copy_load"}:
+                if (self.path_id != "host_pcie" or any(field in raw for field in
+                        ("page_id", "transaction_id", "expected_residency_version"))):
+                    raise ValueError(f"{context} cold copy needs Host path without Page identity")
+                home_domain_id = _non_negative_int(
+                    home_domain_id, f"{context}.home_domain_id")
+                hot = source if kind == "kv_cold_copy_store" else destination
+                cold = destination if kind == "kv_cold_copy_store" else source
+                if (cold.device_id != 0 or hot.device_id != home_domain_id
+                        or cold.tier_id == hot.tier_id):
+                    raise ValueError(f"{context} has invalid cold-copy endpoints")
             elif self.path_id == "host_pcie":
-                raise ValueError("Host path only supports Page movements")
+                raise ValueError("Host path only supports typed Page or KV copy movements")
             elif any(
                 value is not None
                 for value in (

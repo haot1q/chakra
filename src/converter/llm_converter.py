@@ -621,12 +621,11 @@ class LLMConverter:
                             name="movement_expected_residency_version",
                             uint32_val=event.expected_residency_version,
                         ),
-                        ChakraAttr(
-                            name="movement_home_domain_id",
-                            uint32_val=event.home_domain_id,
-                        ),
                     ]
                 )
+            if event.home_domain_id is not None:
+                node.attr.append(ChakraAttr(
+                    name="movement_home_domain_id", uint32_val=event.home_domain_id))
             nodes[event.event_id] = (event, node)
         for event in self.movement_events.prior_events:
             if event.npu_id != npu_id or not event.releases:
