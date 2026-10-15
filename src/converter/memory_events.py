@@ -364,14 +364,19 @@ class MemoryEvents:
                         f"{context}.home_domain_id must match paired device_id"
                     )
             elif kind in {"kv_cold_copy_store", "kv_cold_copy_load"}:
-                if (self.path_id != "host_pcie" or any(field in raw for field in
+                if (self.path_id not in {"host_pcie", "base_die_local"}
+                        or self.path_contract_status != "implemented"
+                        or any(field in raw for field in
                         ("page_id", "transaction_id", "expected_residency_version"))):
-                    raise ValueError(f"{context} cold copy needs Host path without Page identity")
+                    raise ValueError(
+                        f"{context} cold copy needs implemented Host or paired-local path "
+                        "without Page identity")
                 home_domain_id = _non_negative_int(
                     home_domain_id, f"{context}.home_domain_id")
                 hot = source if kind == "kv_cold_copy_store" else destination
                 cold = destination if kind == "kv_cold_copy_store" else source
-                if (cold.device_id != 0 or hot.device_id != home_domain_id
+                cold_device = 0 if self.path_id == "host_pcie" else home_domain_id
+                if (cold.device_id != cold_device or hot.device_id != home_domain_id
                         or cold.tier_id == hot.tier_id):
                     raise ValueError(f"{context} has invalid cold-copy endpoints")
             elif self.path_id == "host_pcie":
