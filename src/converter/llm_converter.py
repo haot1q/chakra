@@ -13,7 +13,7 @@ from .et_validator import validate_et_group
 from .memory_events import MemoryEvents
 from .tier_manifest import TierManifest
 from .service_binding import ServiceBinding
-from .operator_io import OperatorIO
+from .operator_io import OperatorIO, MAX_OPERATOR_IO_BYTES, MAX_OPERATOR_IO_ROWS
 
 
 def _parse_trace_header(line: str) -> tuple[str, dict[str, str]]:
@@ -201,13 +201,16 @@ class LLMConverter:
         self.services = ServiceBinding(path, self.manifest.digest)
         return self
 
-    def configure_operator_io(self, path: str) -> "LLMConverter":
+    def configure_operator_io(
+        self, path: str, *, max_rows: int = MAX_OPERATOR_IO_ROWS,
+        max_bytes: int = MAX_OPERATOR_IO_BYTES,
+    ) -> "LLMConverter":
         """Bind explicit internal operand traffic once before creating any ET."""
         if self._services_frozen or self.operator_io is not None:
             raise ValueError("operator IO configuration is already frozen")
         if self.manifest is None:
             raise ValueError("operator IO requires a native tier manifest")
-        self.operator_io = OperatorIO(path, self.manifest)
+        self.operator_io = OperatorIO(path, self.manifest, max_rows=max_rows, max_bytes=max_bytes)
         return self
 
     def get_global_metadata(self, rank: int | None = None):

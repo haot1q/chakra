@@ -75,14 +75,20 @@ class OperatorIO:
     when a member has no traffic. Unannotated rows retain legacy semantics.
     """
 
-    def __init__(self, path: str, manifest: TierManifest) -> None:
+    def __init__(
+        self, path: str, manifest: TierManifest, *,
+        max_rows: int = MAX_OPERATOR_IO_ROWS, max_bytes: int = MAX_OPERATOR_IO_BYTES,
+    ) -> None:
+        for label, limit in (("rows", max_rows), ("bytes", max_bytes)):
+            if type(limit) is not int or not 0 < limit < 2**63 - 1:
+                raise ValueError(f"operator IO: {label} budget must be a positive bounded integer")
         source = Path(path)
         if source.is_symlink() or not source.is_file():
             raise ValueError("operator IO: expected regular sidecar file")
         with source.open("rb") as stream:
-            encoded = stream.read(MAX_OPERATOR_IO_BYTES + 1)
-        if len(encoded) > MAX_OPERATOR_IO_BYTES:
-            raise ValueError("operator IO: sidecar exceeds byte limit")
+            encoded = stream.read(max_bytes + 1)
+        if len(encoded) > max_bytes:
+            raise ValueError(f"operator IO: sidecar exceeds byte limit: actual>{max_bytes}, limit={max_bytes}")
         body = _fields(json.loads(encoded, object_pairs_hook=_object), {
             "schema_version", "accounting", "tier_manifest_digest", "trace_sha256", "rows",
         })
@@ -97,8 +103,10 @@ class OperatorIO:
         self.schema_version = body["schema_version"]
         self._trace_validated = False
         rows = body["rows"]
-        if not isinstance(rows, list) or not rows or len(rows) > MAX_OPERATOR_IO_ROWS:
+        if not isinstance(rows, list) or not rows:
             raise ValueError("operator IO: expected nonempty bounded rows")
+        if len(rows) > max_rows:
+            raise ValueError(f"operator IO: rows exceed budget: actual={len(rows)}, limit={max_rows}")
         self.rows: dict[tuple[int, int], OperandIO] = {}
         self._emitted: set[tuple[int, int]] = set()
         fields = {"rank", "row", "reads", "writes"}

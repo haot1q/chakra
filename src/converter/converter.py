@@ -5,6 +5,7 @@ from .pytorch_converter import PyTorchConverter
 from .text_converter import TextConverter
 from .llm_converter import LLMConverter
 from .pd_kv_events import convert_pd_kv_sidecar
+from .operator_io import MAX_OPERATOR_IO_BYTES, MAX_OPERATOR_IO_ROWS
 
 
 def setup_logging(log_filename: str) -> None:
@@ -51,7 +52,8 @@ def convert_llm(args: argparse.Namespace) -> None:
     if args.physical_service_bindings:
         converter.configure_physical_services(args.physical_service_bindings)
     if args.operator_io:
-        converter.configure_operator_io(args.operator_io)
+        converter.configure_operator_io(args.operator_io,
+            max_rows=args.operator_io_max_rows, max_bytes=args.operator_io_max_bytes)
     converter.convert()
 
 
@@ -197,6 +199,10 @@ def main() -> None:
                            help="ADR-0041 native deployment binding and run activation JSON")
     llm_parser.add_argument("--operator-io", type=str, default=None,
                            help="Explicit operator-io-v1/v2 internal memory operand sidecar")
+    llm_parser.add_argument("--operator-io-max-rows", type=int, default=MAX_OPERATOR_IO_ROWS,
+                           help="Run-authorized maximum number of operator IO rank/row declarations")
+    llm_parser.add_argument("--operator-io-max-bytes", type=int, default=MAX_OPERATOR_IO_BYTES,
+                           help="Run-authorized maximum encoded operator IO sidecar bytes")
     llm_parser.set_defaults(func=convert_llm)
 
     pd_kv_parser = subparsers.add_parser(
