@@ -1,9 +1,20 @@
 #include "et_feeder.h"
 
+#include <algorithm>
 #include <iostream>
+#include <stdexcept>
 
 using namespace std;
 using namespace Chakra;
+
+namespace {
+void removeDependency(const shared_ptr<ETFeederNode>& node, uint64_t parent_id) {
+  auto* dependencies = node->getChakraNode()->mutable_data_deps();
+  dependencies->erase(
+      remove(dependencies->begin(), dependencies->end(), parent_id),
+      dependencies->end());
+}
+} // namespace
 
 ETFeeder::ETFeeder(string filename)
     : trace_(filename), window_size_(4096 * 256), et_complete_(false) {
@@ -23,11 +34,21 @@ ETFeeder::ETFeeder(string filename)
 ETFeeder::~ETFeeder() {}
 
 void ETFeeder::addNode(shared_ptr<ETFeederNode> node) {
-  dep_graph_[node->getChakraNode()->id()] = node;
+  if (node == nullptr || completed_node_ids_.count(node->id()) != 0 ||
+      !dep_graph_.emplace(node->id(), node).second) {
+    throw invalid_argument("Cannot add a null or duplicate ET node");
+  }
 }
 
 void ETFeeder::removeNode(uint64_t node_id) {
+  if (dep_graph_.count(node_id) == 0) {
+    throw out_of_range("Cannot remove unknown ET node " + to_string(node_id));
+  }
+  if (completed_node_ids_.count(node_id) == 0) {
+    throw logic_error("Cannot remove incomplete ET node " + to_string(node_id));
+  }
   dep_graph_.erase(node_id);
+  if (et_complete_) completed_node_ids_.erase(node_id);
 
   if (!et_complete_ && (dep_free_node_queue_.size() < window_size_)) {
     readNextWindow();
@@ -41,7 +62,12 @@ bool ETFeeder::hasNodesToIssue() {
 shared_ptr<ETFeederNode> ETFeeder::getNextIssuableNode() {
   if (dep_free_node_queue_.size() != 0) {
     shared_ptr<ETFeederNode> node = dep_free_node_queue_.top();
-    dep_free_node_id_set_.erase(node->getChakraNode()->id());
+    const auto id = node->id();
+    if (completed_node_ids_.count(id) != 0 ||
+        dep_free_node_id_set_.erase(id) != 1 ||
+        !issued_node_ids_.emplace(id).second) {
+      throw logic_error("ET ready queue state mismatch for node " + to_string(id));
+    }
     dep_free_node_queue_.pop();
     return node;
   } else {
@@ -50,9 +76,14 @@ shared_ptr<ETFeederNode> ETFeeder::getNextIssuableNode() {
 }
 
 void ETFeeder::pushBackIssuableNode(uint64_t node_id) {
-  shared_ptr<ETFeederNode> node = dep_graph_[node_id];
-  dep_free_node_id_set_.emplace(node_id);
-  dep_free_node_queue_.emplace(node);
+  const auto node = lookupNode(node_id);
+  if (issued_node_ids_.count(node_id) == 0 ||
+      completed_node_ids_.count(node_id) != 0 ||
+      node->getChakraNode()->data_deps_size() != 0) {
+    throw logic_error("Cannot push back ET node not in flight: " + to_string(node_id));
+  }
+  issued_node_ids_.erase(node_id);
+  enqueueIfReady(node);
 }
 
 shared_ptr<ETFeederNode> ETFeeder::lookupNode(uint64_t node_id) {
@@ -66,22 +97,37 @@ shared_ptr<ETFeederNode> ETFeeder::lookupNode(uint64_t node_id) {
 }
 
 void ETFeeder::freeChildrenNodes(uint64_t node_id) {
-  shared_ptr<ETFeederNode> node = dep_graph_[node_id];
+  const auto node = lookupNode(node_id);
+  if (issued_node_ids_.count(node_id) == 0 ||
+      completed_node_ids_.count(node_id) != 0) {
+    throw logic_error("Cannot complete ET node not in flight: " + to_string(node_id));
+  }
+  completed_node_ids_.emplace(node_id);
+  issued_node_ids_.erase(node_id);
   for (auto child : node->getChildren()) {
-    auto child_chakra = child->getChakraNode();
-    for (auto it = child_chakra->mutable_data_deps()->begin();
-         it != child_chakra->mutable_data_deps()->end();
-         ++it) {
-      if (*it == node_id) {
-        child_chakra->mutable_data_deps()->erase(it);
-        break;
-      }
-    }
-    if (child_chakra->data_deps().size() == 0) {
-      dep_free_node_id_set_.emplace(child_chakra->id());
-      dep_free_node_queue_.emplace(child);
+    removeDependency(child, node_id);
+    enqueueIfReady(child);
+  }
+}
+
+void ETFeeder::enqueueIfReady(const shared_ptr<ETFeederNode>& node) {
+  const auto id = node->id();
+  if (node->getChakraNode()->data_deps_size() == 0 &&
+      issued_node_ids_.count(id) == 0 && completed_node_ids_.count(id) == 0 &&
+      dep_free_node_id_set_.emplace(id).second) {
+    dep_free_node_queue_.emplace(node);
+  }
+}
+
+void ETFeeder::discardCompletedHistory() {
+  for (auto it = completed_node_ids_.begin(); it != completed_node_ids_.end();) {
+    if (dep_graph_.count(*it) == 0) {
+      it = completed_node_ids_.erase(it);
+    } else {
+      ++it;
     }
   }
+  completed_node_ids_.rehash(0);
 }
 
 void ETFeeder::readGlobalMetadata() {
@@ -132,14 +178,21 @@ shared_ptr<ETFeederNode> ETFeeder::readNode() {
   shared_ptr<ETFeederNode> node = make_shared<ETFeederNode>(pkt_msg);
 
   bool dep_unresolved = false;
-  for (int i = 0; i < pkt_msg->data_deps_size(); ++i) {
-    auto parent_node = dep_graph_.find(pkt_msg->data_deps(i));
+  auto* dependencies = pkt_msg->mutable_data_deps();
+  for (auto it = dependencies->begin(); it != dependencies->end();) {
+    // A completed parent may still be resident inside an outer callback.
+    if (completed_node_ids_.count(*it) != 0) {
+      it = dependencies->erase(it);
+      continue;
+    }
+    auto parent_node = dep_graph_.find(*it);
     if (parent_node != dep_graph_.end()) {
       parent_node->second->addChild(node);
     } else {
       dep_unresolved = true;
-      node->addDepUnresolvedParentID(pkt_msg->data_deps(i));
+      node->addDepUnresolvedParentID(*it);
     }
+    ++it;
   }
 
   if (dep_unresolved) {
@@ -158,7 +211,10 @@ void ETFeeder::resolveDep() {
     for (auto inner_it = dep_unresolved_parent_ids.begin();
          inner_it != dep_unresolved_parent_ids.end();) {
       auto parent_node = dep_graph_.find(*inner_it);
-      if (parent_node != dep_graph_.end()) {
+      if (completed_node_ids_.count(*inner_it) != 0) {
+        removeDependency(node, *inner_it);
+        inner_it = dep_unresolved_parent_ids.erase(inner_it);
+      } else if (parent_node != dep_graph_.end()) {
         parent_node->second->addChild(node);
         inner_it = dep_unresolved_parent_ids.erase(inner_it);
       } else {
@@ -184,6 +240,7 @@ void ETFeeder::readNextWindow() {
     shared_ptr<ETFeederNode> new_node = readNode();
     if (new_node == nullptr) {
       et_complete_ = true;
+      discardCompletedHistory();
       break;
     }
 
@@ -193,14 +250,8 @@ void ETFeeder::readNextWindow() {
     resolveDep();
   } while ((num_read < window_size_) || (dep_unresolved_node_set_.size() != 0));
 
-  for (auto node_id_node : dep_graph_) {
-    uint64_t node_id = node_id_node.first;
-    shared_ptr<ETFeederNode> node = node_id_node.second;
-    if ((dep_free_node_id_set_.count(node_id) == 0) &&
-        (node->getChakraNode()->data_deps().size() == 0)) {
-      dep_free_node_id_set_.emplace(node_id);
-      dep_free_node_queue_.emplace(node);
-    }
+  for (const auto& node_id_node : dep_graph_) {
+    enqueueIfReady(node_id_node.second);
   }
 }
 

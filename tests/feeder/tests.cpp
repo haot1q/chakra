@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <stdexcept>
 #include "et_feeder.h"
 
 class ETFeederTest : public ::testing::Test {
@@ -60,35 +61,28 @@ TEST_F(ETFeederTest, ConstructorETFeederTest) {
 
 TEST_F(ETFeederTest, RemoveTest) {
   SetUp("tests/data/chakra.0.et");
-  std::shared_ptr<Chakra::ETFeederNode> node = trace->lookupNode(216);
+  std::shared_ptr<Chakra::ETFeederNode> node = trace->getNextIssuableNode();
   ASSERT_EQ(node->id(), 216);
+  trace->freeChildrenNodes(216);
   trace->removeNode(216);
-  freopen("/dev/null", "w", stderr);
-  try {
-    node = trace->lookupNode(216);
-    ASSERT_TRUE(false) << "node should be removed \n";
-  } catch (const std::exception& e) {
-    // this is the desired behaviour
-  }
-  freopen("/dev/tty", "w", stderr);
+  EXPECT_THROW(trace->lookupNode(216), std::out_of_range);
 }
 
 TEST_F(ETFeederTest, RemoveAndGetNextTest) {
   SetUp("tests/data/chakra.0.et");
-  std::shared_ptr<Chakra::ETFeederNode> node = trace->lookupNode(216);
+  std::shared_ptr<Chakra::ETFeederNode> node = trace->getNextIssuableNode();
   ASSERT_EQ(node->id(), 216);
+  trace->freeChildrenNodes(216);
   trace->removeNode(216);
   node = trace->getNextIssuableNode();
-  ASSERT_EQ(node->id(), 216);
+  ASSERT_EQ(node->id(), 217);
 }
 
 TEST_F(ETFeederTest, FreeChildrenTest) {
   SetUp("tests/data/chakra.0.et");
-  std::shared_ptr<Chakra::ETFeederNode> node = trace->lookupNode(216);
+  std::shared_ptr<Chakra::ETFeederNode> node = trace->getNextIssuableNode();
   ASSERT_EQ(node->id(), 216);
   trace->freeChildrenNodes(216);
-  node = trace->getNextIssuableNode();
-  ASSERT_EQ(node->id(), 216);
   node = trace->getNextIssuableNode();
   ASSERT_EQ(node->id(), 217);
 }
@@ -98,26 +92,29 @@ TEST_F(ETFeederTest, HasNodesToIssueTest) {
   std::shared_ptr<Chakra::ETFeederNode> node = trace->getNextIssuableNode();
   ASSERT_EQ(node->id(), 216);
   ASSERT_TRUE(trace->hasNodesToIssue());
-  trace->removeNode(5);
+  EXPECT_THROW(trace->removeNode(5), std::out_of_range);
   ASSERT_TRUE(trace->hasNodesToIssue());
 }
 
 TEST_F(ETFeederTest, PushBackIssuableNodeTest) {
   SetUp("tests/data/chakra.0.et");
-  std::shared_ptr<Chakra::ETFeederNode> node;
-  trace->pushBackIssuableNode(217);
+  std::shared_ptr<Chakra::ETFeederNode> node = trace->getNextIssuableNode();
+  ASSERT_EQ(node->id(), 216);
+  trace->pushBackIssuableNode(216);
+  EXPECT_THROW(trace->pushBackIssuableNode(216), std::logic_error);
+  EXPECT_THROW(trace->pushBackIssuableNode(217), std::logic_error);
   node = trace->getNextIssuableNode();
   ASSERT_EQ(node->id(), 216);
   node = trace->getNextIssuableNode();
-  ASSERT_EQ(node->id(), 217);
+  ASSERT_EQ(node->id(), 432);
 }
 
-TEST_F(ETFeederTest, AddNodeTest) {
+TEST_F(ETFeederTest, RejectDuplicateAddNodeTest) {
   SetUp("tests/data/chakra.0.et");
   std::shared_ptr<Chakra::ETFeederNode> node;
   node = trace->lookupNode(216);
-  trace->removeNode(216);
-  trace->addNode(node);
+  EXPECT_THROW(trace->addNode(node), std::invalid_argument);
+  EXPECT_THROW(trace->addNode(nullptr), std::invalid_argument);
   std::shared_ptr<Chakra::ETFeederNode> node2;
   node2 = trace->lookupNode(216);
   ASSERT_EQ(node2->id(), 216);

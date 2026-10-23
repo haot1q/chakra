@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <memory>
 #include <optional>
 #include <queue>
@@ -29,11 +30,14 @@ class ETFeeder {
   ~ETFeeder();
 
   void addNode(std::shared_ptr<ETFeederNode> node);
+  // Only completed nodes may be removed. Unknown IDs are rejected.
   void removeNode(uint64_t node_id);
   bool hasNodesToIssue();
+  // Taking a ready node leases it until completion or an explicit push-back.
   std::shared_ptr<ETFeederNode> getNextIssuableNode();
   void pushBackIssuableNode(uint64_t node_id);
   std::shared_ptr<ETFeederNode> lookupNode(uint64_t node_id);
+  // Mark an issued node completed before exposing its children. Exactly once.
   void freeChildrenNodes(uint64_t node_id);
   void readGlobalMetadata();
   std::shared_ptr<ETFeederNode> readNode();
@@ -47,6 +51,8 @@ class ETFeeder {
   std::optional<uint32_t> serviceRank() const { return service_rank_; }
 
  private:
+  void enqueueIfReady(const std::shared_ptr<ETFeederNode>& node);
+  void discardCompletedHistory();
   ProtoInputStream trace_;
   const uint32_t window_size_;
   bool et_complete_;
@@ -57,6 +63,10 @@ class ETFeeder {
 
   std::map<uint64_t, std::shared_ptr<ETFeederNode>> dep_graph_{};
   std::unordered_set<uint64_t> dep_free_node_id_set_{};
+  std::unordered_set<uint64_t> issued_node_ids_{};
+  // Until EOF, retain IDs (not nodes) for children read after parent retirement.
+  // At EOF only completed nodes still awaiting removeNode remain in this set.
+  std::unordered_set<uint64_t> completed_node_ids_{};
   std::priority_queue<
       std::shared_ptr<ETFeederNode>,
       std::vector<std::shared_ptr<ETFeederNode>>,
