@@ -893,6 +893,8 @@ class LLMConverter:
                 layers, stage_edges, prefix_count=prefix_count,
                 tp=npus_per_group, rank_offset=self.npu_offset,
             )
+            if self.operator_io.regions is not None:
+                self.operator_io.regions.validate_movements(self.movement_events, self.operator_io.rows)
         output_paths = []
 
         for npu_group in range(num_npu_group):
@@ -903,6 +905,9 @@ class LLMConverter:
                 self._reset_layer_state(layers)
                 npu_id = npu_group * npus_per_group + npu_offset + self.npu_offset
                 movement_nodes = self.get_memory_movement_nodes(npu_id)
+                regions = None if self.operator_io is None else self.operator_io.regions
+                if regions is not None:
+                    regions.prepare_rank(npu_id, movement_nodes)
                 output_filename = "%s.%d.et" % (self.output_filename, npu_id)
                 output_paths.append(Path(output_filename))
                 first_comp_node = True
@@ -978,6 +983,8 @@ class LLMConverter:
                                     layers[layer_num].name,
                                     movement_nodes,
                                 )
+                                region_internal = (regions is not None
+                                    and regions.internal(npu_id, layer_num + prefix_count))
 
                                 # handle pim parent nodes, and if prefill attention remains wait until all attention is done (before o_proj)
                                 if len(pim_parent_nodes) != 0:
@@ -1004,7 +1011,9 @@ class LLMConverter:
                                     else:
                                         for weight_node in layers[layer_num].weight_memory_nodes:
                                             self.add_parent(comp_node, weight_node)
-                                        if layers[layer_num - 1].comm_node != None:
+                                        if region_internal:
+                                            pass  # Explicit source parents are installed below.
+                                        elif layers[layer_num - 1].comm_node != None:
                                             self.add_parent(comp_node, layers[layer_num - 1].comm_node)
                                         elif layers[layer_num - 1].comp_node != None:
                                             self.add_parent(comp_node, layers[layer_num - 1].comp_node)
@@ -1025,9 +1034,12 @@ class LLMConverter:
                                         pim_comp_nodes = [] # reset pim comp nodes
                                         last_batch_type = layers[layer_num].misc
 
-                                for parent in operator_io_tail:
-                                    self.add_parent(comp_node, parent)
+                                if not region_internal:
+                                    for parent in operator_io_tail:
+                                        self.add_parent(comp_node, parent)
                                 operator_io_tail = ()
+                                if regions is not None:
+                                    regions.add_parents(self, comp_node, npu_id, layer_num + prefix_count)
                                 if self.operator_io is not None:
                                     for read in self.operator_io.before_compute(
                                             self, comp_node, npu_id, layer_num + prefix_count):
@@ -1036,6 +1048,9 @@ class LLMConverter:
                                 if self.operator_io is not None:
                                     operator_io_tail = self.operator_io.after_compute(
                                         self, comp_node, npu_id, layer_num + prefix_count)
+                                    if regions is not None:
+                                        regions.complete(self, comp_node, operator_io_tail,
+                                                         npu_id, layer_num + prefix_count)
                                     for write in operator_io_tail:
                                         encode_message(g, write)
 

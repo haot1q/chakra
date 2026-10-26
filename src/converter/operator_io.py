@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from ...schema.protobuf.et_def_pb2 import Node
 from .tier_manifest import TierManifest
+from .operator_regions import OperatorRegions
 
 # Complete multi-rank Native sidecars exceed the old 4 MiB component budget.
 # Keep a finite bound; row/segment limits and strict field validation remain.
@@ -89,10 +90,14 @@ class OperatorIO:
             encoded = stream.read(max_bytes + 1)
         if len(encoded) > max_bytes:
             raise ValueError(f"operator IO: sidecar exceeds byte limit: actual>{max_bytes}, limit={max_bytes}")
-        body = _fields(json.loads(encoded, object_pairs_hook=_object), {
+        raw = json.loads(encoded, object_pairs_hook=_object)
+        fields = {
             "schema_version", "accounting", "tier_manifest_digest", "trace_sha256", "rows",
-        })
-        if (body["schema_version"] not in ("operator-io-v1", "operator-io-v2")
+        }
+        if isinstance(raw, dict) and raw.get("schema_version") == "operator-io-v3":
+            fields.add("regions")
+        body = _fields(raw, fields)
+        if (body["schema_version"] not in ("operator-io-v1", "operator-io-v2", "operator-io-v3")
                 or body["accounting"] != "ucie_transport_v1"
                 or body["tier_manifest_digest"] != manifest.digest):
             raise ValueError("operator IO: schema/accounting/manifest mismatch")
@@ -121,6 +126,8 @@ class OperatorIO:
                 raise ValueError("operator IO: duplicate coordinate or empty row name")
             self.rows[key] = OperandIO(name, _segments(row["reads"], manifest),
                                        _segments(row["writes"], manifest))
+        self.regions = (OperatorRegions(body["regions"], self.rows, max_rows)
+                        if self.schema_version == "operator-io-v3" else None)
 
     def validate_trace(self, path: str, header: dict[str, str], execution: str) -> None:
         self._emitted.clear()
@@ -160,7 +167,7 @@ class OperatorIO:
             if index in expert_rows:
                 raise ValueError("operator IO: expert-owned rows are not supported")
             layer = layers[index]
-            if self.schema_version == "operator-io-v2":
+            if self.schema_version in ("operator-io-v2", "operator-io-v3"):
                 io = OperandIO(layer.name, io.reads, io.writes)
                 self.rows[rank, row] = io
             if (layer.is_expert or io.name != layer.name or layer.comm_type != "NONE"
@@ -175,6 +182,8 @@ class OperatorIO:
             declared.setdefault(row, (owners, set()))[1].add(rank)
         if any(owners != actual for owners, actual in declared.values()):
             raise ValueError("operator IO: missing participating rank declaration")
+        if self.regions is not None:
+            self.regions.validate_rows(stages, prefix_count, tp, rank_offset)
 
     def validate_emission(self) -> None:
         """Prevent later converter branches from silently dropping a declaration."""
