@@ -483,7 +483,10 @@ class LLMConverter:
         if self.movement_events is None:
             return {}
         nodes = {}
-        for event in self.movement_events.events_for_npu(npu_id):
+        events = self.movement_events.events_for_npu(npu_id)
+        workload_owned = self.movement_events.completion_owner == "workload"
+        referenced_events = {dependency for event in events for dependency in event.depends_on}
+        for event in events:
             if event.event_id in self._emitted_movement_event_ids:
                 raise ValueError(
                     f"movement event {event.event_id!r} was emitted more than once"
@@ -523,6 +526,15 @@ class LLMConverter:
                     ),
                     ChakraAttr(name="movement_kind", string_val=event.kind),
                     ChakraAttr(name="movement_phase", string_val=event.phase),
+                    # The feeder may not have loaded a later child yet. Preserve
+                    # the complete producer-known ET lifetime independently of
+                    # DMA phase/priority, including movement-to-movement edges.
+                    ChakraAttr(
+                        name="movement_has_consumers",
+                        bool_val=workload_owned and (
+                            bool(event.releases) or event.event_id in referenced_events
+                        ),
+                    ),
                     ChakraAttr(
                         name="movement_priority_class",
                         string_val=event.priority_class,
@@ -645,10 +657,13 @@ class LLMConverter:
             ])
             nodes[event.event_id] = (event, node)
             self._emitted_movement_event_ids.add(event.event_id)
-        for event, node in nodes.values():
-            for dependency in getattr(event, "depends_on", ()):
-                if dependency in nodes:
-                    self.add_parent(node, nodes[dependency][1])
+        # External preparation keeps its original DMA dependencies, but has no
+        # Workload graph lifetime or ET dependency edges.
+        if workload_owned:
+            for event, node in nodes.values():
+                for dependency in getattr(event, "depends_on", ()):
+                    if dependency in nodes:
+                        self.add_parent(node, nodes[dependency][1])
         return nodes
 
     def add_memory_movement_parents(

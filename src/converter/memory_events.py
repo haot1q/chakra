@@ -417,8 +417,6 @@ class MemoryEvents:
                 )
             if completion_owner == "external_preparation" and releases:
                 raise ValueError("external preparation must not release compute nodes")
-            if phase == "background_fill" and releases:
-                raise ValueError("background_fill must not release compute nodes")
             if (completion_owner == "workload"
                     and phase != "background_fill" and not releases):
                 raise ValueError("foreground movement must release a compute node")

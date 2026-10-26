@@ -449,13 +449,22 @@ def _write_movement_events(
     )
 
 
+@pytest.mark.parametrize("background_consumer", ["none", "compute", "movement"])
 def test_memory_events_add_logical_nodes_and_only_true_consumer_waits(
-    tmp_path: Path,
+    tmp_path: Path, background_consumer: str,
 ) -> None:
     manifest_path = tmp_path / "tiers.json"
     digest = _write_native_manifest(manifest_path)
     events_path = tmp_path / "memory-events.json"
     _write_movement_events(events_path, digest)
+    if background_consumer != "none":
+        payload = json.loads(events_path.read_text())
+        if background_consumer == "compute":
+            payload["events"][1]["releases"] = ["block0_layernorm"]
+        else:
+            payload["events"][0]["depends_on"] = ["background-0"]
+            payload["events"][1]["depends_on"] = []
+        events_path.write_text(json.dumps(payload))
     trace = tmp_path / "native.txt"
     rows = [_native_layer("block0_layernorm"), _native_layer("unrelated")]
     _write_trace(
@@ -483,7 +492,15 @@ def test_memory_events_add_logical_nodes_and_only_true_consumer_waits(
     unrelated = next(node for node in nodes if node.name == "COMP_NODE_unrelated")
     assert critical.id in consumer.data_deps
     assert critical.id not in unrelated.data_deps
-    assert background.id not in consumer.data_deps
+    assert (background.id in consumer.data_deps) == (background_consumer == "compute")
+    assert (background.id in critical.data_deps) == (background_consumer == "movement")
+    assert background.id not in unrelated.data_deps
+    assert _string_attr(background, "movement_phase") == "background_fill"
+    assert _string_attr(background, "movement_priority_class") == "background_fill"
+    assert next(attr.bool_val for attr in critical.attr
+                if attr.name == "movement_has_consumers")
+    assert next(attr.bool_val for attr in background.attr
+                if attr.name == "movement_has_consumers") == (background_consumer != "none")
     assert _uint_attr(critical, "movement_source_iteration_id") == 0
     assert (
         _uint_attr(critical, "movement_max_in_flight_page_movements") == 1
