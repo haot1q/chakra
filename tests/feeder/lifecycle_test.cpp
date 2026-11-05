@@ -104,8 +104,11 @@ void smallLifecycle() {
     writeNode(output, 7, {3});
   });
   ETFeeder feeder(trace.path());
+  require(feeder.readyNodeCount() == 2, "initial ready count includes blocked nodes");
   take(feeder, 1);
+  require(feeder.readyNodeCount() == 1, "taking a node did not reduce ready count");
   take(feeder, 2);
+  require(feeder.readyNodeCount() == 0, "issued nodes remain counted as ready");
   require(feeder.getNextIssuableNode() == nullptr, "blocked child was issued");
   rejects([&] { feeder.pushBackIssuableNode(3); }, "pushed a blocked node");
   rejects([&] { feeder.pushBackIssuableNode(999); }, "pushed an unknown node");
@@ -113,6 +116,7 @@ void smallLifecycle() {
   rejects([&] { feeder.removeNode(999); }, "removed an unknown node");
   rejects([&] { feeder.removeNode(2); }, "removed an incomplete node");
   feeder.pushBackIssuableNode(1);
+  require(feeder.readyNodeCount() == 1, "push-back did not restore ready count");
   rejects([&] { feeder.pushBackIssuableNode(1); }, "pushed a ready node twice");
   take(feeder, 1);
   feeder.freeChildrenNodes(1);
@@ -122,6 +126,7 @@ void smallLifecycle() {
           "completion did not remove all repeated dependencies");
   require(feeder.getNextIssuableNode() == nullptr, "joined child issued too soon");
   feeder.removeNode(1);
+  require(feeder.readyNodeCount() == 0, "remove without new work changed ready count");
   rejects([&] { feeder.removeNode(1); }, "removed a retired node twice");
   complete(feeder, 2);
   take(feeder, 3);
@@ -189,7 +194,9 @@ void concurrentIssuedNodes() {
   ETFeeder feeder(trace.path());
   take(feeder, 1);
   const auto second = take(feeder, 2);
+  require(feeder.readyNodeCount() == kWindow - 2, "in-flight nodes counted as ready");
   complete(feeder, 1);
+  require(feeder.readyNodeCount() == kWindow - 1, "refill did not add one ready node");
   take(feeder, 3);
   require(feeder.lookupNode(2) == second, "refill replaced an in-flight node");
   complete(feeder, 2);

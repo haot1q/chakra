@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <map>
 #include <memory>
 #include <optional>
@@ -33,6 +34,7 @@ class ETFeeder {
   // Only completed nodes may be removed. Unknown IDs are rejected.
   void removeNode(uint64_t node_id);
   bool hasNodesToIssue();
+  std::size_t readyNodeCount() const { return dep_free_node_queue_.size(); }
   // Taking a ready node leases it until completion or an explicit push-back.
   std::shared_ptr<ETFeederNode> getNextIssuableNode();
   void pushBackIssuableNode(uint64_t node_id);
