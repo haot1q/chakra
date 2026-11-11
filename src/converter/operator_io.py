@@ -90,6 +90,7 @@ class OperatorIO:
             encoded = stream.read(max_bytes + 1)
         if len(encoded) > max_bytes:
             raise ValueError(f"operator IO: sidecar exceeds byte limit: actual>{max_bytes}, limit={max_bytes}")
+        self.input_sha256 = hashlib.sha256(encoded).hexdigest()
         raw = json.loads(encoded, object_pairs_hook=_object)
         fields = {
             "schema_version", "accounting", "tier_manifest_digest", "trace_sha256", "rows",
@@ -201,6 +202,8 @@ class OperatorIO:
         reads = []
         for index, (location, size) in enumerate(io.reads):
             read = converter.get_memory_load_node(io.name, f"OPERAND_READ_{index}", location, size)
+            if converter.source_association is not None:
+                converter.source_association.attach(read, rank, row, "read", index)
             read.data_deps.extend(parents)
             converter.add_parent(node, read)
             reads.append(read)
@@ -219,6 +222,8 @@ class OperatorIO:
         writes = []
         for index, (location, size) in enumerate(io.writes):
             write = converter.get_memory_store_node(io.name, f"OPERAND_WRITE_{index}", location, size)
+            if converter.source_association is not None:
+                converter.source_association.attach(write, rank, row, "write", index)
             converter.add_parent(write, node)
             writes.append(write)
         return tuple(writes)
