@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from io import TextIOWrapper
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Mapping
 from enum import Enum
 
 from ...schema.protobuf.et_def_pb2 import *
@@ -14,6 +14,7 @@ from .memory_events import MemoryEvents
 from .tier_manifest import TierManifest
 from .service_binding import ServiceBinding
 from .operator_io import OperatorIO, MAX_OPERATOR_IO_BYTES, MAX_OPERATOR_IO_ROWS
+from .source_execution_association import SourceExecutionAssociation
 
 
 def _parse_trace_header(line: str) -> tuple[str, dict[str, str]]:
@@ -170,6 +171,7 @@ class LLMConverter:
         self.manifest = TierManifest(tier_manifest) if tier_manifest else None
         self.services: ServiceBinding | None = None
         self.operator_io: OperatorIO | None = None
+        self.source_association: SourceExecutionAssociation | None = None
         self._services_frozen = False
         if memory_events and self.manifest is None:
             raise ValueError("--memory-events requires --tier-manifest")
@@ -211,6 +213,19 @@ class LLMConverter:
         if self.manifest is None:
             raise ValueError("operator IO requires a native tier manifest")
         self.operator_io = OperatorIO(path, self.manifest, max_rows=max_rows, max_bytes=max_bytes)
+        return self
+
+    def configure_source_association(
+        self, path: str, *, limits: Mapping[str, int | str] | None = None,
+    ) -> "LLMConverter":
+        """Bind prepared Source references without changing existing node costs."""
+        if self._services_frozen or self.source_association is not None:
+            raise ValueError("source association configuration is already frozen")
+        if self.operator_io is None or self.manifest is None:
+            raise ValueError("source association requires original operator IO and tier manifest")
+        self.source_association = SourceExecutionAssociation(
+            path, operator_io=self.operator_io, manifest=self.manifest,
+            trace_path=self.input_filename, limits=limits)
         return self
 
     def get_global_metadata(self, rank: int | None = None):
@@ -1532,6 +1547,8 @@ class LLMConverter:
         return output_paths
 
     def convert(self):
+        if self.source_association is not None:
+            self.source_association.reset_emission(range(self.npu_offset, self.npu_offset + self.num_npus))
         if (self.movement_events is not None
                 and self.movement_events.completion_owner != "workload"):
             raise ValueError("external preparation cannot enter a workload graph")
@@ -1615,5 +1632,7 @@ class LLMConverter:
         self.validate_movement_emission()
         if self.operator_io is not None:
             self.operator_io.validate_emission()
+        if self.source_association is not None:
+            self.source_association.validate_emission()
         validate_et_group(outputs)
         return outputs

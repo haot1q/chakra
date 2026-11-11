@@ -6,6 +6,7 @@ from .text_converter import TextConverter
 from .llm_converter import LLMConverter
 from .pd_kv_events import convert_pd_kv_sidecar
 from .operator_io import MAX_OPERATOR_IO_BYTES, MAX_OPERATOR_IO_ROWS
+from .source_execution_association import parse_limits_argument
 
 
 def setup_logging(log_filename: str) -> None:
@@ -54,6 +55,11 @@ def convert_llm(args: argparse.Namespace) -> None:
     if args.operator_io:
         converter.configure_operator_io(args.operator_io,
             max_rows=args.operator_io_max_rows, max_bytes=args.operator_io_max_bytes)
+    if args.source_execution_association:
+        converter.configure_source_association(args.source_execution_association,
+            limits=args.source_association_limits)
+    elif args.source_association_limits is not None:
+        raise ValueError("source association limits require the association input")
     converter.convert()
 
 
@@ -203,6 +209,10 @@ def main() -> None:
                            help="Run-authorized maximum number of operator IO rank/row declarations")
     llm_parser.add_argument("--operator-io-max-bytes", type=int, default=MAX_OPERATOR_IO_BYTES,
                            help="Run-authorized maximum encoded operator IO sidecar bytes")
+    llm_parser.add_argument("--source-execution-association", default=None,
+                           help="Prepared original Source associations for existing operand nodes")
+    llm_parser.add_argument("--source-association-limits", type=parse_limits_argument, default=None,
+                           help="Bounded JSON object of host association limits")
     llm_parser.set_defaults(func=convert_llm)
 
     pd_kv_parser = subparsers.add_parser(
