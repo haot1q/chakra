@@ -63,7 +63,7 @@ class OperatorRegions:
                 key = row.rank, row.row
                 io = io_rows.get(key)
                 if key in self.rows or io is None:
-                    raise ValueError("operator region: overlap or missing original IO row")
+                    raise ValueError(f"operator region: overlap or missing original IO row rank={row.rank} row={row.row}")
                 if not row.present and (io.reads or io.writes):
                     raise ValueError("operator region: transparent row cannot own IO")
                 self.rows[key] = row

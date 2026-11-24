@@ -31,7 +31,7 @@ def test_sparse_visit_skips_gaps_and_keeps_stage_and_prefix_offsets():
 
 
 @pytest.mark.parametrize("defect,reason", [
-    ("missing_io", "missing original IO"), ("both_removed", "Source owner digest"),
+    ("missing_io", "missing original IO row rank=0 row=2"), ("both_removed", "Source owner digest"),
     ("parent", "Source owner digest"), ("foreign_rank", "Source owner digest"),
     ("budget", "budget"), ("dense", "unknown fields"),
 ])
