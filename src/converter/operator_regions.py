@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from itertools import chain
 from typing import TYPE_CHECKING
 
@@ -39,15 +40,18 @@ class OperatorRegions:
     """One indexed invocation; no scheduler, allocation or source hazard state."""
 
     def __init__(self, values: object, io_rows: dict[tuple[int, int], OperandIO],
-                 max_rows: int) -> None:
+                 max_rows: int, *, sparse: bool = False) -> None:
         if not isinstance(values, list) or not values:
             raise ValueError("operator region: expected nonempty region array")
+        self.sparse = sparse
+        self.region_by_index: dict[int, int] = {}
+        self.next_after: dict[tuple[int, int], int] = {}
         self.rows: dict[tuple[int, int], RegionRow] = {}
         self.intervals: list[tuple[int, int, int, frozenset[int]]] = []
         self.frontiers: dict[tuple[int, int], tuple[Node, ...]] = {}
         self.waits: dict[tuple[int, str], list[Node]] = {}
         for value in values:
-            region = _fields(value, {"stage", "entry", "exit", "rows"})
+            region = _fields(value, {"stage", "entry", "exit", "rows"} | ({"source_owner_sha256"} if sparse else set()))
             stage, entry, exit = (_uint(region[key]) for key in ("stage", "entry", "exit"))
             records = region["rows"]
             if (exit <= entry or not isinstance(records, list) or not records
@@ -64,8 +68,28 @@ class OperatorRegions:
                     raise ValueError("operator region: transparent row cannot own IO")
                 self.rows[key] = row
                 ranks.setdefault(row.rank, {})[row.row] = row
+            if sparse:
+                digest = hashlib.sha256()
+                for rank in sorted(ranks):
+                    indices = tuple(sorted(ranks[rank]))
+                    for row in indices:
+                        if not ranks[rank][row].present:
+                            raise ValueError(f"operator region: sparse rank={rank} row={row} must be present")
+                        ordered = ",".join(map(str, ranks[rank][row].parents))
+                        digest.update(f"{rank}/{row}:{ordered}\n".encode("ascii"))
+                    for previous, following in zip(indices, indices[1:]):
+                        if following != previous + 1:
+                            self.next_after[rank, previous] = following
+                if region["source_owner_sha256"] != digest.hexdigest():
+                    raise ValueError(f"operator region: Source owner digest mismatch at entry={entry}")
+                # Populate the public row index from observed real rows. Reject
+                # even a maliciously wide interval without traversing its range.
+                union = {i for owned in ranks.values() for i in owned}
+                if len(union) != exit - entry + 1 or any(i in self.region_by_index for i in union):
+                    raise ValueError("operator region: incomplete or overlapping sparse interval")
+                self.region_by_index.update(dict.fromkeys(union, entry))
             for rows in ranks.values():
-                self._require_closed(rows, entry, exit)
+                self._require_closed(rows, entry, exit, sparse)
             self.intervals.append((stage, entry, exit, frozenset(ranks)))
 
     @staticmethod
@@ -86,8 +110,8 @@ class OperatorRegions:
         return RegionRow(rank, row, item["present"], parents, entry)
 
     @staticmethod
-    def _require_closed(rows: dict[int, RegionRow], entry: int, exit: int) -> None:
-        if (len(rows) != exit - entry + 1 or entry not in rows or exit not in rows
+    def _require_closed(rows: dict[int, RegionRow], entry: int, exit: int, sparse: bool) -> None:
+        if ((not sparse and len(rows) != exit - entry + 1) or entry not in rows or exit not in rows
                 or not rows[entry].present or not rows[exit].present):
             raise ValueError("operator region: incomplete coverage or absent entry/exit")
         for row in rows.values():
@@ -114,10 +138,27 @@ class OperatorRegions:
         self.frontiers.clear()
         self.waits.clear()
 
+    def stage_indices(self, rank: int, start: int, stop: int, prefix: int):
+        """Original outside rows plus only the rank's in-region work."""
+        index = start
+        while index < stop:
+            yield index
+            global_row = index + prefix
+            index = self.next_after.get((rank, global_row), global_row + 1) - prefix
+
     def validate_movements(self, events: MemoryEvents | None,
-                           io_rows: dict[tuple[int, int], OperandIO]) -> None:
+                           io_rows: dict[tuple[int, int], OperandIO], *, layers=(), prefix: int = 0) -> None:
         """Validate every rank before any ET opens, without constructing ET nodes."""
         if events is None:
+            return
+        if self.sparse:
+            names = {layer.name: i + prefix for i, layer in enumerate(layers)
+                     if i + prefix in self.region_by_index}
+            for event in chain(events.events, events.prior_events):
+                waits = event.waits_for if isinstance(event, MovementEvent) else ()
+                for name in chain(event.releases, waits):
+                    if name in names and (event.npu_id, names[name]) not in self.rows:
+                        raise ValueError(f"operator region: absent Page anchor rank={event.npu_id} row={names[name]}")
             return
         absent = {(row.rank, io_rows[key].name) for key, row in self.rows.items()
                   if not row.present}
