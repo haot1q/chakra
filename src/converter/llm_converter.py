@@ -909,18 +909,24 @@ class LLMConverter:
                 tp=npus_per_group, rank_offset=self.npu_offset,
             )
             if self.operator_io.regions is not None:
-                self.operator_io.regions.validate_movements(self.movement_events, self.operator_io.rows)
+                self.operator_io.regions.validate_movements(self.movement_events, self.operator_io.rows,
+                                                           layers=layers, prefix=prefix_count)
         output_paths = []
 
+        regions = self.operator_io.regions if self.operator_io is not None else None
+        sparse = regions is not None and regions.sparse
+        previous_layers = ()
         for npu_group in range(num_npu_group):
             for npu_offset in range(npus_per_group):
                 # Re-read the authoritative edges per rank: the walk below may
                 # rebind layer_end if it ever overruns.
                 layer_start, layer_end = stage_edges[npu_group]
-                self._reset_layer_state(layers)
+                self._reset_layer_state(previous_layers if sparse else layers)
                 npu_id = npu_group * npus_per_group + npu_offset + self.npu_offset
                 movement_nodes = self.get_memory_movement_nodes(npu_id)
-                regions = None if self.operator_io is None else self.operator_io.regions
+                if sparse:
+                    indices = regions.stage_indices(npu_id, layer_start, layer_end, prefix_count)
+                    previous_layers = map(layers.__getitem__, indices)
                 if regions is not None:
                     regions.prepare_rank(npu_id, movement_nodes)
                 output_filename = "%s.%d.et" % (self.output_filename, npu_id)
@@ -1094,8 +1100,11 @@ class LLMConverter:
                                 for parent in operator_io_tail:
                                     self.add_parent(comm_coll_node, parent)
                                 encode_message(g, comm_coll_node)
-                            # add layer_num
-                            layer_num += 1
+                            if sparse:
+                                global_row = layer_num + prefix_count
+                                layer_num = regions.next_after.get((npu_id, global_row), global_row + 1) - prefix_count
+                            else:
+                                layer_num += 1
                         # expert layer starts
                         elif layers[layer_num].is_expert:
                             # communication can happen even with one NPU in the group, for example, expert input gathering in data parallel

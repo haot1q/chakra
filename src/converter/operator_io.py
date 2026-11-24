@@ -95,10 +95,10 @@ class OperatorIO:
         fields = {
             "schema_version", "accounting", "tier_manifest_digest", "trace_sha256", "rows",
         }
-        if isinstance(raw, dict) and raw.get("schema_version") == "operator-io-v3":
+        if isinstance(raw, dict) and raw.get("schema_version") in ("operator-io-v3", "operator-io-v4"):
             fields.add("regions")
         body = _fields(raw, fields)
-        if (body["schema_version"] not in ("operator-io-v1", "operator-io-v2", "operator-io-v3")
+        if (body["schema_version"] not in ("operator-io-v1", "operator-io-v2", "operator-io-v3", "operator-io-v4")
                 or body["accounting"] != "ucie_transport_v1"
                 or body["tier_manifest_digest"] != manifest.digest):
             raise ValueError("operator IO: schema/accounting/manifest mismatch")
@@ -127,8 +127,8 @@ class OperatorIO:
                 raise ValueError("operator IO: duplicate coordinate or empty row name")
             self.rows[key] = OperandIO(name, _segments(row["reads"], manifest),
                                        _segments(row["writes"], manifest))
-        self.regions = (OperatorRegions(body["regions"], self.rows, max_rows)
-                        if self.schema_version == "operator-io-v3" else None)
+        self.regions = (OperatorRegions(body["regions"], self.rows, max_rows, sparse=self.schema_version == "operator-io-v4")
+                        if self.schema_version in ("operator-io-v3", "operator-io-v4") else None)
 
     def validate_trace(self, path: str, header: dict[str, str], execution: str) -> None:
         self._emitted.clear()
@@ -153,7 +153,7 @@ class OperatorIO:
             raise ValueError("operator IO: validate Trace identity before resolving rows")
         if any(layer.is_pim or (not layer.is_expert and layer.misc != "NONE") for layer in layers):
             raise ValueError("operator IO: PIM/interleaving is not supported")
-        declared: dict[int, tuple[set[int], set[int]]] = {}
+        declared: dict[int, tuple[range, set[int]]] = {}
         expert_rows: set[int] = set()
         in_expert = False
         for index, layer in enumerate(layers):
@@ -168,7 +168,7 @@ class OperatorIO:
             if index in expert_rows:
                 raise ValueError("operator IO: expert-owned rows are not supported")
             layer = layers[index]
-            if self.schema_version in ("operator-io-v2", "operator-io-v3"):
+            if self.schema_version in ("operator-io-v2", "operator-io-v3", "operator-io-v4"):
                 io = OperandIO(layer.name, io.reads, io.writes)
                 self.rows[rank, row] = io
             if (layer.is_expert or io.name != layer.name or layer.comm_type != "NONE"
@@ -177,11 +177,17 @@ class OperatorIO:
             if row == prefix_count or index == len(layers) - 1:
                 raise ValueError("operator IO: ingress/final output keep legacy ownership")
             stage = next(i for i, (start, stop) in enumerate(stages) if start <= index < stop)
-            owners = set(range(rank_offset + stage * tp, rank_offset + (stage + 1) * tp))
-            if rank not in owners:
+            first_rank = rank_offset + stage * tp
+            if not first_rank <= rank < first_rank + tp:
                 raise ValueError("operator IO: rank does not own this pipeline row")
-            declared.setdefault(row, (owners, set()))[1].add(rank)
-        if any(owners != actual for owners, actual in declared.values()):
+            if self.regions and self.regions.sparse and row in self.regions.region_by_index:
+                if (rank, row) not in self.regions.rows:
+                    raise ValueError(f"operator IO: unexpected sparse declaration rank={rank} row={row}")
+            else:
+                if row not in declared:
+                    declared[row] = (range(first_rank, first_rank + tp), set())
+                declared[row][1].add(rank)
+        if any(len(owners) != len(actual) for owners, actual in declared.values()):
             raise ValueError("operator IO: missing participating rank declaration")
         if self.regions is not None:
             self.regions.validate_rows(stages, prefix_count, tp, rank_offset)
