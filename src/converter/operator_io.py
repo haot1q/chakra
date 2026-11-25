@@ -78,7 +78,7 @@ class OperatorIO:
 
     def __init__(
         self, path: str, manifest: TierManifest, *,
-        max_rows: int = MAX_OPERATOR_IO_ROWS, max_bytes: int = MAX_OPERATOR_IO_BYTES,
+        max_rows: int = MAX_OPERATOR_IO_ROWS, max_bytes: int = MAX_OPERATOR_IO_BYTES, job_memory: bool = False,
     ) -> None:
         for label, limit in (("rows", max_rows), ("bytes", max_bytes)):
             if type(limit) is not int or not 0 < limit < 2**63 - 1:
@@ -86,12 +86,16 @@ class OperatorIO:
         source = Path(path)
         if source.is_symlink() or not source.is_file():
             raise ValueError("operator IO: expected regular sidecar file")
-        with source.open("rb") as stream:
-            encoded = stream.read(max_bytes + 1)
-        if len(encoded) > max_bytes:
-            raise ValueError(f"operator IO: sidecar exceeds byte limit: actual>{max_bytes}, limit={max_bytes}")
-        self.input_sha256 = hashlib.sha256(encoded).hexdigest()
-        raw = json.loads(encoded, object_pairs_hook=_object)
+        if job_memory:
+            from .joint_job_json import read_job_document
+            raw, self.input_sha256 = read_job_document(source)
+        else:
+            with source.open("rb") as stream:
+                encoded = stream.read(min(source.stat().st_size, max_bytes) + 1)
+            if len(encoded) > max_bytes:
+                raise ValueError(f"operator IO: sidecar exceeds byte limit: actual>{max_bytes}, limit={max_bytes}")
+            self.input_sha256 = hashlib.sha256(encoded).hexdigest()
+            raw = json.loads(encoded, object_pairs_hook=_object)
         fields = {
             "schema_version", "accounting", "tier_manifest_digest", "trace_sha256", "rows",
         }
@@ -111,7 +115,7 @@ class OperatorIO:
         rows = body["rows"]
         if not isinstance(rows, list) or not rows:
             raise ValueError("operator IO: expected nonempty bounded rows")
-        if len(rows) > max_rows:
+        if not job_memory and len(rows) > max_rows:
             raise ValueError(f"operator IO: rows exceed budget: actual={len(rows)}, limit={max_rows}")
         self.rows: dict[tuple[int, int], OperandIO] = {}
         self._emitted: set[tuple[int, int]] = set()
@@ -127,7 +131,7 @@ class OperatorIO:
                 raise ValueError("operator IO: duplicate coordinate or empty row name")
             self.rows[key] = OperandIO(name, _segments(row["reads"], manifest),
                                        _segments(row["writes"], manifest))
-        self.regions = (OperatorRegions(body["regions"], self.rows, max_rows, sparse=self.schema_version == "operator-io-v4")
+        self.regions = (OperatorRegions(body["regions"], self.rows, None if job_memory else max_rows, sparse=self.schema_version == "operator-io-v4")
                         if self.schema_version in ("operator-io-v3", "operator-io-v4") else None)
 
     def validate_trace(self, path: str, header: dict[str, str], execution: str) -> None:

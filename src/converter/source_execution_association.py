@@ -88,23 +88,29 @@ def parse_limits_argument(value: str) -> dict[str, int]:
     return _limits(values)
 
 
-def _regular_bytes(path: str | Path, limit: int) -> bytes:
+def _regular_bytes(path: str | Path, limit: int | None) -> bytes:
     candidate = Path(path).absolute()
     _require(".." not in candidate.parts, "path must not traverse upward")
     _require(not any(part.is_symlink() for part in (candidate, *candidate.parents)),
              "symlink input is not allowed")
     before = candidate.stat()
-    _require(stat.S_ISREG(before.st_mode) and before.st_size <= limit,
+    _require(stat.S_ISREG(before.st_mode) and (limit is None or before.st_size <= limit),
              "expected regular input within byte limit")
     with candidate.open("rb") as stream:
         opened = os.fstat(stream.fileno())
         _require((opened.st_dev, opened.st_ino) == (before.st_dev, before.st_ino),
                  "input changed before read")
-        encoded = stream.read(limit + 1)
+        chunks = []
+        count = 0
+        while chunk := stream.read(1 << 20):
+            count += len(chunk)
+            _require(count <= before.st_size, "input grew during read")
+            chunks.append(chunk)
+        encoded = b"".join(chunks)
         after = os.fstat(stream.fileno())
     def identity(info: os.stat_result) -> tuple[int, int, int, int]:
         return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
-    _require(len(encoded) <= limit and identity(before) == identity(opened) == identity(after)
+    _require(len(encoded) == before.st_size and identity(before) == identity(opened) == identity(after)
              == identity(candidate.stat()),
              "input exceeded byte limit or changed during read")
     return encoded
@@ -161,8 +167,8 @@ def _document(encoded: bytes, limits: Mapping[str, int]) -> dict:
                    "source_selection_sha256 trace_sha256 operator_io_sha256 tier_manifest_digest ranks")
 
 
-def _table(value: object, fields: str, limit: int) -> list[dict]:
-    _require(isinstance(value, list) and len(value) <= limit, "table exceeds record limit")
+def _table(value: object, fields: str, limit: int | None) -> list[dict]:
+    _require(isinstance(value, list) and (limit is None or len(value) <= limit), "table exceeds record limit")
     for index, item in enumerate(value):
         _fields(item, fields)
         _require(item["ref"] == str(index), "table refs must be canonical indices")
@@ -175,7 +181,7 @@ def _reference(value: object, table: list[dict]) -> dict:
     return table[index]
 
 
-def _invocations(value: object, limit: int) -> list[dict]:
+def _invocations(value: object, limit: int | None) -> list[dict]:
     table = _table(value, "ref batch_id invocation_id", limit)
     identities = set()
     for item in table:
@@ -185,7 +191,7 @@ def _invocations(value: object, limit: int) -> list[dict]:
     return table
 
 
-def _backings(value: object, limit: int) -> list[dict]:
+def _backings(value: object, limit: int | None) -> list[dict]:
     table = _table(value, "ref backing_identity extent_bytes catalog_generation", limit)
     identities = set()
     for item in table:
@@ -199,7 +205,7 @@ def _backings(value: object, limit: int) -> list[dict]:
     return table
 
 
-def _operands(value: object, invocations: list, backings: list, limit: int) -> list[dict]:
+def _operands(value: object, invocations: list, backings: list, limit: int | None) -> list[dict]:
     table = _table(value, "ref invocation_ref source_boundary execution_layer role origin operation "
                    "ordinal_start backing_ref offset_bytes length_bytes stride_bytes count", limit)
     occurrences = 0
@@ -223,7 +229,7 @@ def _operands(value: object, invocations: list, backings: list, limit: int) -> l
         identity = tuple(item[k] for k in ("invocation_ref", "source_boundary", "origin"))
         ordinal_ranges[identity].append((ordinal, ordinal + count))
         occurrences += count
-        _require(occurrences <= limit, "expanded occurrences exceed record limit")
+        _require(limit is None or occurrences <= limit, "expanded occurrences exceed record limit")
     for ranges in ordinal_ranges.values():
         previous = -1
         for start, end in sorted(ranges):
@@ -250,7 +256,7 @@ def _authorization(value: object) -> None:
                  "non-Page authorization cannot carry Page identity")
 
 
-def _pieces(value: object, operands: list, manifest: TierManifest, limit: int) -> list[dict]:
+def _pieces(value: object, operands: list, manifest: TierManifest, limit: int | None) -> list[dict]:
     table = _table(value, "ref operand_ref run_index offset_bytes length_bytes location "
                    "authorization volume_ordinal", limit)
     intervals = defaultdict(list)
@@ -293,14 +299,23 @@ class SourceExecutionAssociation:
 
     def __init__(self, path: str | Path, *, operator_io: OperatorIO,
                  manifest: TierManifest, trace_path: str | Path,
-                 limits: Mapping[str, int | str] | None = None) -> None:
+                 limits: Mapping[str, int | str] | None = None, job_memory: bool = False) -> None:
         self.limits = MappingProxyType(_limits(limits))
-        encoded = _regular_bytes(path, self.limits["association_bytes"])
-        self.input_sha256 = hashlib.sha256(encoded).hexdigest()
-        self.document = _document(encoded, self.limits)
+        self.record_limit = None if job_memory else self.limits["table_records"]
+        self.piece_limit = None if job_memory else self.limits["pieces"]
+        if job_memory:
+            from .joint_job_json import read_job_document
+            self.document, self.input_sha256 = read_job_document(path, max_depth=self.limits["json_depth"])
+            _strings(self.document, self.limits["string_bytes"])
+            _fields(self.document, "schema run_id source_provenance_digest source_profile "
+                    "source_selection_sha256 trace_sha256 operator_io_sha256 tier_manifest_digest ranks")
+        else:
+            encoded = _regular_bytes(path, self.limits["association_bytes"])
+            self.input_sha256 = hashlib.sha256(encoded).hexdigest()
+            self.document = _document(encoded, self.limits)
         self._validate_identity(operator_io, manifest, trace_path)
         raw_ranks = self.document["ranks"]
-        _require(isinstance(raw_ranks, list) and 0 < len(raw_ranks) <= self.limits["table_records"],
+        _require(isinstance(raw_ranks, list) and bool(raw_ranks) and (job_memory or len(raw_ranks) <= self.record_limit),
                  "expected bounded nonempty ranks")
         self.ranks: dict[int, dict] = {}
         self.groups: dict[tuple[int, int, str, int], dict] = {}
@@ -336,19 +351,19 @@ class SourceExecutionAssociation:
                  "rank execution context differs from input")
         _require(_uint(context["execution_iteration"]) < 2**32, "backend iteration exceeds uint32")
         rank = _uint(context["rank"])
-        limit = self.limits["table_records"]
+        limit = self.record_limit
         invocations = _invocations(item["invocations"], limit)
         backings = _backings(item["backings"], limit)
         operands = _operands(item["operands"], invocations, backings, limit)
-        _require(len(invocations) + len(backings) + len(operands) <= limit, "combined table limit exceeded")
-        pieces = _pieces(item["pieces"], operands, manifest, self.limits["pieces"])
+        _require(limit is None or len(invocations) + len(backings) + len(operands) <= limit, "combined table limit exceeded")
+        pieces = _pieces(item["pieces"], operands, manifest, self.piece_limit)
         covered = self._groups(item["groups"], pieces, operands, rank, operator_io)
         self._omissions(item["source_unassociated"], pieces, covered)
         return rank
 
     def _groups(self, values: object, pieces: list, operands: list,
                 rank: int, operator_io: OperatorIO) -> set[str]:
-        _require(isinstance(values, list) and len(values) <= self.limits["pieces"], "group limit exceeded")
+        _require(isinstance(values, list) and (self.piece_limit is None or len(values) <= self.piece_limit), "group limit exceeded")
         covered = set()
         for value in values:
             group = _fields(value, "ref row operation segment_index location bytes piece_refs")
@@ -370,7 +385,7 @@ class SourceExecutionAssociation:
 
     def _group_pieces(self, group: dict, pieces: list, operands: list, covered: set[str]) -> None:
         refs = group["piece_refs"]
-        _require(isinstance(refs, list) and 0 < len(refs) <= self.limits["pieces"], "empty or oversized group")
+        _require(isinstance(refs, list) and bool(refs) and (self.piece_limit is None or len(refs) <= self.piece_limit), "empty or oversized group")
         total = 0
         for ref in refs:
             piece = _reference(ref, pieces)
@@ -383,7 +398,7 @@ class SourceExecutionAssociation:
         _require(total == int(group["bytes"]), "group piece bytes differ from original bill")
 
     def _omissions(self, values: object, pieces: list, covered: set[str]) -> None:
-        _require(isinstance(values, list) and len(values) <= self.limits["pieces"], "omission limit exceeded")
+        _require(isinstance(values, list) and (self.piece_limit is None or len(values) <= self.piece_limit), "omission limit exceeded")
         omitted = set()
         for value in values:
             item = _fields(value, "piece_ref reason")

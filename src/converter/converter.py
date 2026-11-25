@@ -54,10 +54,10 @@ def convert_llm(args: argparse.Namespace) -> None:
         converter.configure_physical_services(args.physical_service_bindings)
     if args.operator_io:
         converter.configure_operator_io(args.operator_io,
-            max_rows=args.operator_io_max_rows, max_bytes=args.operator_io_max_bytes)
+            max_rows=args.operator_io_max_rows, max_bytes=args.operator_io_max_bytes, job_memory=args.joint_job_memory)
     if args.source_execution_association:
         converter.configure_source_association(args.source_execution_association,
-            limits=args.source_association_limits)
+            limits=args.source_association_limits, job_memory=args.joint_job_memory)
     elif args.source_association_limits is not None:
         raise ValueError("source association limits require the association input")
     converter.convert()
@@ -211,6 +211,8 @@ def main() -> None:
                            help="Run-authorized maximum encoded operator IO sidecar bytes")
     llm_parser.add_argument("--source-execution-association", default=None,
                            help="Prepared original Source associations for existing operand nodes")
+    llm_parser.add_argument("--joint-job-memory", action="store_true",
+                            help="Use the joint job memory budget for total artifact sizes")
     llm_parser.add_argument("--source-association-limits", type=parse_limits_argument, default=None,
                            help="Bounded JSON object of host association limits")
     llm_parser.set_defaults(func=convert_llm)
