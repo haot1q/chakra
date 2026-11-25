@@ -205,18 +205,18 @@ class LLMConverter:
 
     def configure_operator_io(
         self, path: str, *, max_rows: int = MAX_OPERATOR_IO_ROWS,
-        max_bytes: int = MAX_OPERATOR_IO_BYTES,
+        max_bytes: int = MAX_OPERATOR_IO_BYTES, job_memory: bool = False,
     ) -> "LLMConverter":
         """Bind explicit internal operand traffic once before creating any ET."""
         if self._services_frozen or self.operator_io is not None:
             raise ValueError("operator IO configuration is already frozen")
         if self.manifest is None:
             raise ValueError("operator IO requires a native tier manifest")
-        self.operator_io = OperatorIO(path, self.manifest, max_rows=max_rows, max_bytes=max_bytes)
+        self.operator_io = OperatorIO(path, self.manifest, max_rows=max_rows, max_bytes=max_bytes, job_memory=job_memory)
         return self
 
     def configure_source_association(
-        self, path: str, *, limits: Mapping[str, int | str] | None = None,
+        self, path: str, *, limits: Mapping[str, int | str] | None = None, job_memory: bool = False,
     ) -> "LLMConverter":
         """Bind prepared Source references without changing existing node costs."""
         if self._services_frozen or self.source_association is not None:
@@ -225,7 +225,7 @@ class LLMConverter:
             raise ValueError("source association requires original operator IO and tier manifest")
         self.source_association = SourceExecutionAssociation(
             path, operator_io=self.operator_io, manifest=self.manifest,
-            trace_path=self.input_filename, limits=limits)
+            trace_path=self.input_filename, limits=limits, job_memory=job_memory)
         return self
 
     def get_global_metadata(self, rank: int | None = None):

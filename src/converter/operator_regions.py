@@ -40,7 +40,7 @@ class OperatorRegions:
     """One indexed invocation; no scheduler, allocation or source hazard state."""
 
     def __init__(self, values: object, io_rows: dict[tuple[int, int], OperandIO],
-                 max_rows: int, *, sparse: bool = False) -> None:
+                 max_rows: int | None, *, sparse: bool = False) -> None:
         if not isinstance(values, list) or not values:
             raise ValueError("operator region: expected nonempty region array")
         self.sparse = sparse
@@ -55,7 +55,7 @@ class OperatorRegions:
             stage, entry, exit = (_uint(region[key]) for key in ("stage", "entry", "exit"))
             records = region["rows"]
             if (exit <= entry or not isinstance(records, list) or not records
-                    or len(records) + len(self.rows) > max_rows):
+                    or max_rows is not None and len(records) + len(self.rows) > max_rows):
                 raise ValueError("operator region: unordered interval or row budget exceeded")
             ranks = {}
             for record in records:
