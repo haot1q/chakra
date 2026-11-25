@@ -86,18 +86,16 @@ class OperatorIO:
         source = Path(path)
         if source.is_symlink() or not source.is_file():
             raise ValueError("operator IO: expected regular sidecar file")
-        chunks = []
-        total = 0
-        with source.open("rb") as stream:
-            while chunk := stream.read(1 << 20):
-                total += len(chunk)
-                if not job_memory and total > max_bytes:
-                    raise ValueError(f"operator IO: sidecar exceeds byte limit: actual>{max_bytes}, limit={max_bytes}")
-                chunks.append(chunk)
-        encoded = b"".join(chunks)
-        del chunks
-        self.input_sha256 = hashlib.sha256(encoded).hexdigest()
-        raw = json.loads(encoded, object_pairs_hook=_object)
+        if job_memory:
+            from .joint_job_json import read_job_document
+            raw, self.input_sha256 = read_job_document(source)
+        else:
+            with source.open("rb") as stream:
+                encoded = stream.read(min(source.stat().st_size, max_bytes) + 1)
+            if len(encoded) > max_bytes:
+                raise ValueError(f"operator IO: sidecar exceeds byte limit: actual>{max_bytes}, limit={max_bytes}")
+            self.input_sha256 = hashlib.sha256(encoded).hexdigest()
+            raw = json.loads(encoded, object_pairs_hook=_object)
         fields = {
             "schema_version", "accounting", "tier_manifest_digest", "trace_sha256", "rows",
         }

@@ -303,9 +303,16 @@ class SourceExecutionAssociation:
         self.limits = MappingProxyType(_limits(limits))
         self.record_limit = None if job_memory else self.limits["table_records"]
         self.piece_limit = None if job_memory else self.limits["pieces"]
-        encoded = _regular_bytes(path, None if job_memory else self.limits["association_bytes"])
-        self.input_sha256 = hashlib.sha256(encoded).hexdigest()
-        self.document = _document(encoded, self.limits)
+        if job_memory:
+            from .joint_job_json import read_job_document
+            self.document, self.input_sha256 = read_job_document(path, max_depth=self.limits["json_depth"])
+            _strings(self.document, self.limits["string_bytes"])
+            _fields(self.document, "schema run_id source_provenance_digest source_profile "
+                    "source_selection_sha256 trace_sha256 operator_io_sha256 tier_manifest_digest ranks")
+        else:
+            encoded = _regular_bytes(path, self.limits["association_bytes"])
+            self.input_sha256 = hashlib.sha256(encoded).hexdigest()
+            self.document = _document(encoded, self.limits)
         self._validate_identity(operator_io, manifest, trace_path)
         raw_ranks = self.document["ranks"]
         _require(isinstance(raw_ranks, list) and bool(raw_ranks) and (job_memory or len(raw_ranks) <= self.record_limit),

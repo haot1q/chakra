@@ -328,10 +328,15 @@ def test_actual_rank_mismatch_rejects_before_expanding_an_unbounded_range(tmp_pa
         reader.reset_emission(range(1 << 40))
 
 
-def test_joint_job_uses_memory_for_tables_and_retains_reference_checks(tmp_path):
+def test_joint_job_uses_memory_for_tables_and_retains_reference_checks(tmp_path, monkeypatch):
+    from chakra.src.converter import joint_job_json
+    monkeypatch.delenv("CX_EXPERIMENT_MEMORY_SCOPE", raising=False)
     case = _case(tmp_path)
     with pytest.raises(ValueError, match="limit"):
         _reader(case, limits={"table_records": 1, "pieces": 1})
+    with pytest.raises(ValueError, match="whole-job cgroup"):
+        _reader(case, job_memory=True)
+    monkeypatch.setattr(joint_job_json, "require_job_scope", lambda: None)
     reader = _reader(case, limits={"table_records": 1, "pieces": 1, "association_bytes": 1},
                      job_memory=True)
     assert len(reader.ranks[0]["pieces"]) == 5
